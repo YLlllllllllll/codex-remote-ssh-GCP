@@ -24,9 +24,9 @@ reject_pattern() {
 }
 
 printf '== static syntax ==\n'
-bash -n bin/kinit-refresh bin/codex-gcp-remote bin/stay-awake.sh scripts/install.sh scripts/fake-repair-ci.sh
+bash -n bin/kinit-refresh bin/codex-gcp-remote bin/codex-gcp-monitor bin/stay-awake.sh scripts/install.sh scripts/fake-repair-ci.sh
 swiftc -parse app/kinit-refresh-status.swift
-plutil -lint launchd/com.example.kinit-refresh.plist launchd/com.example.kinit-refresh-status.plist launchd/com.example.stay-awake.plist >/dev/null
+plutil -lint launchd/com.example.kinit-refresh.plist launchd/com.example.kinit-refresh-status.plist launchd/com.example.stay-awake.plist launchd/com.example.codex-gcp-monitor.plist >/dev/null
 python3 -m py_compile tools/codex-http-to-socks.py
 
 printf '== app menu contract ==\n'
@@ -43,6 +43,13 @@ need_pattern 'force_reset_local_proxy' bin/codex-gcp-remote
 need_pattern 'force_reset_remote_proxy' bin/codex-gcp-remote
 need_pattern 'restart_remote_codex_app_server' bin/codex-gcp-remote
 need_pattern 'start_remote_forward' bin/codex-gcp-remote
+
+printf '== passive monitor contract ==\n'
+need_pattern 'codex-gcp-monitor \[sample\|status\|tail \[n\]\|path\]' bin/codex-gcp-monitor
+need_pattern 'monitor.jsonl' bin/codex-gcp-monitor
+need_pattern 'monitor-latest.env' bin/codex-gcp-monitor
+need_pattern 'StartInterval' launchd/com.example.codex-gcp-monitor.plist
+reject_pattern 'kinit-refresh remote-gcp|clean-repair-fast|killall|pkill|launchctl setenv|/Applications/Codex.app' bin/codex-gcp-monitor
 
 printf '== clean repair ordering ==\n'
 python3 - <<'PY'

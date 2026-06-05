@@ -10,9 +10,14 @@
 # 此脚本同时被 ~/Library/LaunchAgents/com.example.kinit-refresh.plist
 # 调用,因此手动执行和定时执行行为完全一致。
 
-export PATH="$HOME/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/opt/homebrew/share/google-cloud-sdk/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+LOCAL_USER="$(id -un)"
+LOCAL_HOME="$(dscl . -read "/Users/${LOCAL_USER}" NFSHomeDirectory 2>/dev/null | awk '{ print $2; exit }')"
+LOCAL_HOME="${LOCAL_HOME:-$HOME}"
+export HOME="$LOCAL_HOME"
 
-CONFIG_FILE="${KINIT_REFRESH_CONFIG:-$HOME/.config/codex-gcp-refresh/config.env}"
+export PATH="$LOCAL_HOME/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/opt/homebrew/share/google-cloud-sdk/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+CONFIG_FILE="${KINIT_REFRESH_CONFIG:-$LOCAL_HOME/.config/codex-gcp-refresh/config.env}"
 if [ -f "$CONFIG_FILE" ]; then
     # shellcheck disable=SC1090
     . "$CONFIG_FILE"
@@ -33,7 +38,7 @@ KINIT_KEYCHAIN_SERVICE="${KINIT_KEYCHAIN_SERVICE:-example-kinit-refresh}"
 KINIT_KEYCHAIN_ACCOUNT="${KINIT_KEYCHAIN_ACCOUNT:-$PRINCIPAL}"
 JUMP_PROXY_SERVICE="${JUMP_PROXY_SERVICE:-host/jump-proxy.example.com@REALM.EXAMPLE}"
 SSH_PROBE_TARGET="${SSH_PROBE_TARGET:-remote-workspace}"
-CODEX_REFRESH_SCRIPT="${CODEX_REFRESH_SCRIPT:-$HOME/bin/codex-gcp-remote}"
+CODEX_REFRESH_SCRIPT="${CODEX_REFRESH_SCRIPT:-$LOCAL_HOME/bin/codex-gcp-remote}"
 
 log() {
     local ts
@@ -213,7 +218,7 @@ save_keychain_password() {
             -a "$KINIT_KEYCHAIN_ACCOUNT" \
             -s "$KINIT_KEYCHAIN_SERVICE" \
             -l "Bytedance kinit-refresh password" \
-            -j "Used by $HOME/bin/kinit-refresh to refresh Kerberos ticket" \
+            -j "Used by $LOCAL_HOME/bin/kinit-refresh to refresh Kerberos ticket" \
             -w
         rc=$?
     else
@@ -233,7 +238,7 @@ save_keychain_password() {
             -a "$KINIT_KEYCHAIN_ACCOUNT" \
             -s "$KINIT_KEYCHAIN_SERVICE" \
             -l "Bytedance kinit-refresh password" \
-            -j "Used by $HOME/bin/kinit-refresh to refresh Kerberos ticket" \
+            -j "Used by $LOCAL_HOME/bin/kinit-refresh to refresh Kerberos ticket" \
             -w "$password"
         rc=$?
     fi

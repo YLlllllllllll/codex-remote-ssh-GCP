@@ -56,7 +56,16 @@ Expected result:
 
 ## If It Still Fails
 
-Run read-only diagnosis first:
+Run the passive monitor history and read-only diagnosis first:
+
+```bash
+REAL_HOME="$(dscl . -read "/Users/$(id -un)" NFSHomeDirectory 2>/dev/null | awk '{print $2; exit}')"
+REAL_HOME="${REAL_HOME:-/Users/$(id -un)}"
+"$REAL_HOME/bin/codex-gcp-monitor" status
+"$REAL_HOME/bin/codex-gcp-monitor" tail 120
+```
+
+Then run diagnosis:
 
 ```bash
 REAL_HOME="$(dscl . -read "/Users/$(id -un)" NFSHomeDirectory 2>/dev/null | awk '{print $2; exit}')"
@@ -74,3 +83,14 @@ Then repair once more with the one-shot command. Report the failing layer only a
 - GCP egress reachability
 
 Keep the fix focused on those layers.
+
+## Passive Monitor
+
+The monitor is intended to collect evidence before random disconnects:
+
+```bash
+"$REAL_HOME/bin/codex-gcp-monitor" status
+"$REAL_HOME/bin/codex-gcp-monitor" tail 120
+```
+
+It writes JSONL to `$REAL_HOME/.codex-gcp-tunnel/monitor.jsonl` and a latest summary to `$REAL_HOME/.codex-gcp-tunnel/monitor-latest.env`. It is read-only and must not be used as a repair mechanism.

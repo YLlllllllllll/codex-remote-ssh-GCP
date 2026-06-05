@@ -52,6 +52,7 @@ set -Eeuo pipefail
 LOCAL_USER="$(id -un)"
 LOCAL_HOME="${LOCAL_HOME:-$(dscl . -read "/Users/${LOCAL_USER}" NFSHomeDirectory 2>/dev/null | awk '{ print $2; exit }')}"
 LOCAL_HOME="${LOCAL_HOME:-$HOME}"
+export HOME="$LOCAL_HOME"
 
 CONFIG_FILE="${CODEX_GCP_REFRESH_CONFIG:-$LOCAL_HOME/.config/codex-gcp-refresh/config.env}"
 if [[ -f "$CONFIG_FILE" ]]; then
@@ -65,7 +66,7 @@ GCP_PORT="${GCP_PORT:-443}"
 GCP_KEY="${GCP_KEY:-$LOCAL_HOME/.ssh/google_compute_engine}"
 GCP_EXPECTED_IP="${GCP_EXPECTED_IP:-203.0.113.10}"
 
-REMOTE_HOST="${REMOTE_HOST:-remote-workspace}"
+REMOTE_HOST="${REMOTE_HOST:-${SSH_PROBE_TARGET:-remote-workspace}}"
 REMOTE_HOME="${REMOTE_HOME:-/home/tiger}"
 
 LOCAL_SOCKS_HOST="${LOCAL_SOCKS_HOST:-127.0.0.1}"

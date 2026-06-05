@@ -47,6 +47,35 @@ codex-gcp-remote clean-repair-fast
 codex-gcp-remote verify-fast
 ```
 
+## Passive Monitor
+
+`codex-gcp-monitor` is installed as a LaunchAgent and samples the GCP path every 60 seconds. It is read-only: it does not repair, kill processes, bind ports, change routes, or touch Codex.app.
+
+It records:
+
+- local listeners on `1080` and `7890`
+- route/interface used for the GCP VM
+- local `7890` egress IP
+- remote `10800` listener and egress IP
+- ChatGPT endpoint HTTP code through remote `10800`
+- remote app-server and SSH notty process counts
+- latest `/tmp/kinit-refresh.status`
+
+Common commands:
+
+```bash
+codex-gcp-monitor status
+codex-gcp-monitor tail
+codex-gcp-monitor path
+```
+
+Logs are stored under `~/.codex-gcp-tunnel/`:
+
+```text
+monitor.jsonl
+monitor-latest.env
+```
+
 ## Non-Disruptive CI
 
 Use this when editing the scripts. It does not kill processes, change routes, bind ports, SSH to the remote workspace, or touch Codex.app:
