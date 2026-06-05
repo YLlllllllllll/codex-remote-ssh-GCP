@@ -390,6 +390,33 @@ verify_codex_chain_fast() {
     return 0
 }
 
+verify_codex_chain_clean_fast() {
+    if [ ! -x "$CODEX_REFRESH_SCRIPT" ]; then
+        log "失败, Codex 修复脚本不存在或不可执行: $CODEX_REFRESH_SCRIPT"
+        return 127
+    fi
+
+    log "强制清理并重建 Codex Remote GCP 链路: ${CODEX_REFRESH_SCRIPT} clean-repair-fast"
+    run_with_timeout "$CODEX_TIMEOUT_SECONDS" "$CODEX_REFRESH_SCRIPT" clean-repair-fast
+    local rc=$?
+    if [ "$rc" -ne 0 ]; then
+        log "失败, Codex Remote GCP 强制清理修复退出码 ${rc}"
+        reset_ssh_control_masters
+        return "$rc"
+    fi
+
+    log "快速验证 Codex Remote GCP 出海: ${CODEX_REFRESH_SCRIPT} verify-fast"
+    run_with_timeout "$CODEX_TIMEOUT_SECONDS" "$CODEX_REFRESH_SCRIPT" verify-fast
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        log "失败, Codex Remote GCP 快速验证退出码 ${rc}"
+        reset_ssh_control_masters
+        return "$rc"
+    fi
+
+    return 0
+}
+
 case "${1:-}" in
     status)
         klist 2>&1
@@ -422,6 +449,9 @@ case "${1:-}" in
     gcp|remote-gcp|codex-gcp|refresh-gcp)
         MODE="remote-gcp"
         ;;
+    gcp-clean|remote-gcp-clean|codex-gcp-clean|refresh-gcp-clean)
+        MODE="remote-gcp-clean"
+        ;;
     gcp-full|remote-gcp-full|codex-gcp-full|refresh-gcp-full)
         MODE="remote-gcp-full"
         ;;
@@ -429,7 +459,7 @@ case "${1:-}" in
         MODE="full"
         ;;
     *)
-        echo "Usage: kinit-refresh [status|log|save-password|delete-password|ssh-only|remote-gcp|remote-gcp-full]" >&2
+        echo "Usage: kinit-refresh [status|log|save-password|delete-password|ssh-only|remote-gcp|remote-gcp-clean|remote-gcp-full]" >&2
         exit 2
         ;;
 esac
@@ -503,7 +533,7 @@ if [ "$MODE" = "ssh-only" ]; then
     exit "$RC"
 fi
 
-if [ "$MODE" = "remote-gcp" ] || [ "$MODE" = "remote-gcp-full" ]; then
+if [ "$MODE" = "remote-gcp" ] || [ "$MODE" = "remote-gcp-clean" ] || [ "$MODE" = "remote-gcp-full" ]; then
     EXP=$(klist 2>/dev/null | awk '/krbtgt/ {print $5, $6, $7, $8; exit}')
     log "kinit-refresh Remote-GCP 启动 (mode=${MODE}, codex_timeout=${CODEX_TIMEOUT_SECONDS}s, ssh_probe=${SSH_PROBE_TARGET})"
     write_status "running" "checking" "checking" "checking" "$EXP" "正在刷新 Codex Remote GCP 链路"
@@ -519,6 +549,9 @@ if [ "$MODE" = "remote-gcp" ] || [ "$MODE" = "remote-gcp-full" ]; then
 
         write_status "running" "ok" "checking" "checking" "$EXP" "SSH 可用, 正在执行完整 Codex Remote GCP repair+verify"
         verify_codex_chain
+    elif [ "$MODE" = "remote-gcp-clean" ]; then
+        write_status "running" "checking" "checking" "checking" "$EXP" "正在强制清理并重建 Codex Remote GCP 链路"
+        verify_codex_chain_clean_fast
     else
         # Fast path intentionally skips the separate SSH probe and full codex exec.
         # codex-gcp-remote already exercises SSH while repairing 10800, then

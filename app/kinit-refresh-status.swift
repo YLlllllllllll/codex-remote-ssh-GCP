@@ -37,6 +37,7 @@ final class StatusApp: NSObject, NSApplicationDelegate {
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "刷新 SSH", action: #selector(refreshSSH), keyEquivalent: "r"))
         menu.addItem(NSMenuItem(title: "刷新 Remote GCP", action: #selector(refreshRemoteGCP), keyEquivalent: "g"))
+        menu.addItem(NSMenuItem(title: "强制清理 Remote GCP", action: #selector(cleanRemoteGCP), keyEquivalent: "c"))
         menu.addItem(NSMenuItem(title: "完整验证 Remote GCP", action: #selector(refreshRemoteGCPFull), keyEquivalent: "f"))
         menu.addItem(startStayAwakeItem)
         menu.addItem(stopStayAwakeItem)
@@ -118,6 +119,10 @@ final class StatusApp: NSObject, NSApplicationDelegate {
 
     @objc private func refreshRemoteGCP() {
         runRefresh(title: "🟡KC", arguments: ["remote-gcp"])
+    }
+
+    @objc private func cleanRemoteGCP() {
+        runRefresh(title: "🟡KC", arguments: ["remote-gcp-clean"])
     }
 
     @objc private func refreshRemoteGCPFull() {

@@ -102,6 +102,9 @@ Commands:
   repair     Ensure local 1080, local 7890, remote 10800, and remote Codex wrappers.
   repair-fast
              Ensure only local 1080, local 7890, and remote 10800.
+  clean-repair-fast
+             Force reset local 1080/7890, remote 10800, stale SSH sessions,
+             and remote Codex app-server, then rebuild the fast path.
   verify     Run direct SSH remote Codex validation, including openai-ok.
   verify-fast
              Verify remote 10800 egress and ChatGPT endpoint reachability.
@@ -315,6 +318,7 @@ if ! ss -ltn 2>/dev/null | awk -v port="$REMOTE_HTTP_PORT" '$4 ~ ":" port "$" { 
   exit 0
 fi
 
+remote_user="$(id -un 2>/dev/null || true)"
 self=$$
 keep=" $self "
 pid="$self"
@@ -685,6 +689,72 @@ done
 REMOTE
 }
 
+force_reset_local_proxy() {
+  section "Force reset local 1080/7890"
+  kill_listeners "$LOCAL_HTTP_PORT"
+  kill_listeners "$LOCAL_SOCKS_PORT"
+  rm -f "$STATE_DIR/gcp-socks.manual.pid" "$STATE_DIR/privoxy.manual.pid" 2>/dev/null || true
+}
+
+force_reset_remote_proxy() {
+  section "Force reset remote 10800 and SSH ControlMasters"
+  reset_remote_forward_controlmasters
+  ssh_remote "REMOTE_HTTP_PORT='$REMOTE_HTTP_PORT' REMOTE_CONTROL_MIN_AGE='$STALE_REMOTE_SSHD_MIN_AGE' bash -s" <<'REMOTE' || true
+set -Eeuo pipefail
+
+self=$$
+keep=" $self "
+pid="$self"
+while :; do
+  pid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')"
+  [ -n "$pid" ] || break
+  keep="${keep}${pid} "
+  [ "$pid" = "1" ] && break
+done
+
+victims="$(ps -eo pid=,etimes=,args= 2>/dev/null | awk -v keep="$keep" -v min_age="$REMOTE_CONTROL_MIN_AGE" -v remote_user="$remote_user" '
+  $0 ~ "sshd: " remote_user "@notty" {
+    pid=$1
+    age=$2
+    if (age >= min_age && index(keep, " " pid " ") == 0) {
+      print pid
+    }
+  }
+')"
+
+if [ -n "$victims" ]; then
+  echo "killing remote non-tty ssh sessions: $(echo "$victims" | tr '\n' ' ')"
+  kill $victims 2>/dev/null || true
+  sleep 1
+  kill -9 $victims 2>/dev/null || true
+fi
+
+ss -ltn 2>/dev/null | egrep ":${REMOTE_HTTP_PORT}|:10801|:18080|:18081" || true
+REMOTE
+}
+
+restart_remote_codex_app_server() {
+  section "Restart remote Codex app-server"
+  ssh_remote 'bash -s' <<'REMOTE' || true
+set -Eeuo pipefail
+
+pids="$(ps -eo pid=,args= 2>/dev/null | awk '
+  /codex app-server proxy|app-server --listen unix:\/\// {
+    if ($0 !~ /awk /) {
+      print $1
+    }
+  }
+')"
+
+if [ -n "$pids" ]; then
+  echo "killing remote codex app-server pids: $(echo "$pids" | tr '\n' ' ')"
+  kill $pids 2>/dev/null || true
+  sleep 1
+  kill -9 $pids 2>/dev/null || true
+fi
+REMOTE
+}
+
 start_remote_forward() {
   section "Ensure remote HTTP ${REMOTE_HTTP_HOST}:${REMOTE_HTTP_PORT}"
   mkdir -p "$STATE_DIR"
@@ -814,6 +884,19 @@ repair_fast() {
   printf 'Run fast validation with: %s verify-fast\n' "$(basename "$0")"
 }
 
+clean_repair_fast() {
+  stop_local_launchd_if_present
+  force_reset_local_proxy
+  force_reset_remote_proxy
+  start_local_socks
+  start_local_http
+  SKIP_REMOTE_PLAIN_CHECK=1
+  start_remote_forward
+  restart_remote_codex_app_server
+  section "Clean fast repair complete"
+  printf 'Run fast validation with: %s verify-fast\n' "$(basename "$0")"
+}
+
 verify_fast() {
   section "Fast remote GCP validation"
   local out rc
@@ -903,6 +986,9 @@ case "$cmd" in
     ;;
   repair-fast)
     repair_fast
+    ;;
+  clean-repair-fast)
+    clean_repair_fast
     ;;
   verify)
     verify
