@@ -13,11 +13,7 @@ final class StatusApp: NSObject, NSApplicationDelegate {
     private let staleSeconds: TimeInterval = 20 * 60
     private var timer: Timer?
     private let summaryItem = NSMenuItem(title: "刷新状态中...", action: nil, keyEquivalent: "")
-    private let codexItem = NSMenuItem(title: "Codex: unknown | Proxy: unknown", action: nil, keyEquivalent: "")
-    private let updatedItem = NSMenuItem(title: "更新: unknown", action: nil, keyEquivalent: "")
-    private let stayAwakeItem = NSMenuItem(title: "防休眠: unknown", action: nil, keyEquivalent: "")
-    private let startStayAwakeItem = NSMenuItem(title: "开启防休眠", action: #selector(startStayAwake), keyEquivalent: "a")
-    private let stopStayAwakeItem = NSMenuItem(title: "停止防休眠", action: #selector(stopStayAwake), keyEquivalent: "s")
+    private let toggleStayAwakeItem = NSMenuItem(title: "保持唤醒", action: #selector(toggleStayAwake), keyEquivalent: "a")
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -31,19 +27,10 @@ final class StatusApp: NSObject, NSApplicationDelegate {
     private func setupMenu() {
         let menu = NSMenu()
         menu.addItem(summaryItem)
-        menu.addItem(codexItem)
-        menu.addItem(updatedItem)
-        menu.addItem(stayAwakeItem)
         menu.addItem(NSMenuItem.separator())
+        menu.addItem(NSMenuItem(title: "修复 GCP", action: #selector(refreshRemoteGCP), keyEquivalent: "g"))
         menu.addItem(NSMenuItem(title: "刷新 SSH", action: #selector(refreshSSH), keyEquivalent: "r"))
-        menu.addItem(NSMenuItem(title: "刷新 Remote GCP", action: #selector(refreshRemoteGCP), keyEquivalent: "g"))
-        menu.addItem(NSMenuItem(title: "强制清理 Remote GCP", action: #selector(cleanRemoteGCP), keyEquivalent: "c"))
-        menu.addItem(NSMenuItem(title: "完整验证 Remote GCP", action: #selector(refreshRemoteGCPFull), keyEquivalent: "f"))
-        menu.addItem(startStayAwakeItem)
-        menu.addItem(stopStayAwakeItem)
-        menu.addItem(NSMenuItem(title: "打开日志", action: #selector(openLog), keyEquivalent: "l"))
-        menu.addItem(NSMenuItem.separator())
-        menu.addItem(NSMenuItem(title: "退出状态栏", action: #selector(quit), keyEquivalent: "q"))
+        menu.addItem(toggleStayAwakeItem)
         statusItem.menu = menu
         statusItem.autosaveName = NSStatusItem.AutosaveName("com.example.kinit-refresh-status")
         statusItem.button?.title = "⚪KC"
@@ -81,13 +68,10 @@ final class StatusApp: NSObject, NSApplicationDelegate {
         statusItem.button?.toolTip = "kinit-refresh: \(message) | SSH: \(ssh) | Proxy: \(proxy) | Codex: \(codex) | Exp: \(shortExp)"
 
         summaryItem.title = "\(title) | SSH: \(ssh) | \(message)"
-        codexItem.title = "Codex: \(codex) | Proxy: \(proxy)"
-        updatedItem.title = "更新: \(updated)"
+        summaryItem.toolTip = "Proxy: \(proxy) | Codex: \(codex) | 更新: \(updated)"
 
         let awakeRunning = isStayAwakeRunning()
-        stayAwakeItem.title = awakeRunning ? "防休眠: 开启" : "防休眠: 停止"
-        startStayAwakeItem.isEnabled = !awakeRunning
-        stopStayAwakeItem.isEnabled = awakeRunning
+        toggleStayAwakeItem.title = awakeRunning ? "关闭防休眠" : "保持唤醒"
     }
 
     private func readStatus() -> [String: String] {
@@ -121,14 +105,6 @@ final class StatusApp: NSObject, NSApplicationDelegate {
         runRefresh(title: "🟡KC", arguments: ["remote-gcp"])
     }
 
-    @objc private func cleanRemoteGCP() {
-        runRefresh(title: "🟡KC", arguments: ["remote-gcp-clean"])
-    }
-
-    @objc private func refreshRemoteGCPFull() {
-        runRefresh(title: "🟡KC", arguments: ["remote-gcp-full"])
-    }
-
     private func runRefresh(title: String, arguments: [String]) {
         statusItem.button?.title = title
         DispatchQueue.global(qos: .utility).async {
@@ -153,7 +129,15 @@ final class StatusApp: NSObject, NSApplicationDelegate {
         return kill(pid, 0) == 0
     }
 
-    @objc private func startStayAwake() {
+    @objc private func toggleStayAwake() {
+        if isStayAwakeRunning() {
+            stopStayAwake()
+        } else {
+            startStayAwake()
+        }
+    }
+
+    private func startStayAwake() {
         statusItem.button?.title = "🟡 AWK"
         DispatchQueue.global(qos: .utility).async {
             let domain = "gui/\(getuid())"
@@ -165,7 +149,7 @@ final class StatusApp: NSObject, NSApplicationDelegate {
         }
     }
 
-    @objc private func stopStayAwake() {
+    private func stopStayAwake() {
         statusItem.button?.title = "🟡 AWK"
         DispatchQueue.global(qos: .utility).async {
             let domain = "gui/\(getuid())"
@@ -188,14 +172,6 @@ final class StatusApp: NSObject, NSApplicationDelegate {
             task.waitUntilExit()
         } catch {
         }
-    }
-
-    @objc private func openLog() {
-        NSWorkspace.shared.open(URL(fileURLWithPath: "/tmp/kinit-refresh.log"))
-    }
-
-    @objc private func quit() {
-        NSApp.terminate(nil)
     }
 }
 

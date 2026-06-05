@@ -446,11 +446,8 @@ case "${1:-}" in
     ssh|ssh-only|refresh-ssh)
         MODE="ssh-only"
         ;;
-    gcp|remote-gcp|codex-gcp|refresh-gcp)
+    gcp|remote-gcp|codex-gcp|refresh-gcp|gcp-clean|remote-gcp-clean|codex-gcp-clean|refresh-gcp-clean)
         MODE="remote-gcp"
-        ;;
-    gcp-clean|remote-gcp-clean|codex-gcp-clean|refresh-gcp-clean)
-        MODE="remote-gcp-clean"
         ;;
     gcp-full|remote-gcp-full|codex-gcp-full|refresh-gcp-full)
         MODE="remote-gcp-full"
@@ -459,7 +456,7 @@ case "${1:-}" in
         MODE="full"
         ;;
     *)
-        echo "Usage: kinit-refresh [status|log|save-password|delete-password|ssh-only|remote-gcp|remote-gcp-clean|remote-gcp-full]" >&2
+        echo "Usage: kinit-refresh [status|log|save-password|delete-password|ssh-only|remote-gcp]" >&2
         exit 2
         ;;
 esac
@@ -533,7 +530,7 @@ if [ "$MODE" = "ssh-only" ]; then
     exit "$RC"
 fi
 
-if [ "$MODE" = "remote-gcp" ] || [ "$MODE" = "remote-gcp-clean" ] || [ "$MODE" = "remote-gcp-full" ]; then
+if [ "$MODE" = "remote-gcp" ] || [ "$MODE" = "remote-gcp-full" ]; then
     EXP=$(klist 2>/dev/null | awk '/krbtgt/ {print $5, $6, $7, $8; exit}')
     log "kinit-refresh Remote-GCP 启动 (mode=${MODE}, codex_timeout=${CODEX_TIMEOUT_SECONDS}s, ssh_probe=${SSH_PROBE_TARGET})"
     write_status "running" "checking" "checking" "checking" "$EXP" "正在刷新 Codex Remote GCP 链路"
@@ -549,15 +546,9 @@ if [ "$MODE" = "remote-gcp" ] || [ "$MODE" = "remote-gcp-clean" ] || [ "$MODE" =
 
         write_status "running" "ok" "checking" "checking" "$EXP" "SSH 可用, 正在执行完整 Codex Remote GCP repair+verify"
         verify_codex_chain
-    elif [ "$MODE" = "remote-gcp-clean" ]; then
-        write_status "running" "checking" "checking" "checking" "$EXP" "正在强制清理并重建 Codex Remote GCP 链路"
-        verify_codex_chain_clean_fast
     else
-        # Fast path intentionally skips the separate SSH probe and full codex exec.
-        # codex-gcp-remote already exercises SSH while repairing 10800, then
-        # verifies ChatGPT reachability through the remote proxy.
-        write_status "running" "checking" "checking" "checking" "$EXP" "正在快速执行 Codex Remote GCP repair+verify"
-        verify_codex_chain_fast
+        write_status "running" "checking" "checking" "checking" "$EXP" "正在一键强制修复 Codex Remote GCP 链路"
+        verify_codex_chain_clean_fast
     fi
     RC=$?
     if [ "$RC" -eq 0 ]; then

@@ -15,12 +15,9 @@ remote Codex -> remote 127.0.0.1:10800 HTTP
 
 The menu-bar app reads `/tmp/kinit-refresh.status` and exposes:
 
+- `修复 GCP`: one-shot forced cleanup, rebuild, and validation for the remote Codex GCP path.
 - `刷新 SSH`: refresh/verify Kerberos and company SSH only.
-- `刷新 Remote GCP`: repair the local GCP tunnel and remote Codex proxy path.
-- `强制清理 Remote GCP`: kill stale local/remote proxy state and rebuild the fast path.
-- `完整验证 Remote GCP`: also checks remote wrapper/config drift.
-- `开启/停止防休眠`: controls the LaunchAgent-backed stay-awake helper.
-- `打开日志`: opens `/tmp/kinit-refresh.log`.
+- `保持唤醒` / `关闭防休眠`: toggles the LaunchAgent-backed stay-awake helper.
 
 ## Install
 
@@ -44,13 +41,18 @@ kinit-refresh save-password
 kinit-refresh status
 kinit-refresh ssh-only
 kinit-refresh remote-gcp
-kinit-refresh remote-gcp-clean
-kinit-refresh remote-gcp-full
 kinit-refresh log
 codex-gcp-remote diagnose
-codex-gcp-remote repair-fast
 codex-gcp-remote clean-repair-fast
 codex-gcp-remote verify-fast
+```
+
+## Non-Disruptive CI
+
+Use this when editing the scripts. It does not kill processes, change routes, bind ports, SSH to the remote workspace, or touch Codex.app:
+
+```bash
+scripts/fake-repair-ci.sh
 ```
 
 ## Cost Controls

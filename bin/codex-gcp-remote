@@ -329,8 +329,8 @@ while :; do
   [ "$pid" = "1" ] && break
 done
 
-victims="$(ps -eo pid=,etimes=,args= 2>/dev/null | awk -v keep="$keep" -v min_age="$STALE_REMOTE_SSHD_MIN_AGE" '
-  /sshd: tiger@notty/ {
+victims="$(ps -eo pid=,etimes=,args= 2>/dev/null | awk -v keep="$keep" -v min_age="$STALE_REMOTE_SSHD_MIN_AGE" -v remote_user="$remote_user" '
+  $0 ~ "sshd: " remote_user "@notty" {
     pid=$1
     age=$2
     if (age >= min_age && index(keep, " " pid " ") == 0) {
@@ -702,6 +702,7 @@ force_reset_remote_proxy() {
   ssh_remote "REMOTE_HTTP_PORT='$REMOTE_HTTP_PORT' REMOTE_CONTROL_MIN_AGE='$STALE_REMOTE_SSHD_MIN_AGE' bash -s" <<'REMOTE' || true
 set -Eeuo pipefail
 
+remote_user="$(id -un 2>/dev/null || true)"
 self=$$
 keep=" $self "
 pid="$self"
@@ -888,11 +889,11 @@ clean_repair_fast() {
   stop_local_launchd_if_present
   force_reset_local_proxy
   force_reset_remote_proxy
+  restart_remote_codex_app_server
   start_local_socks
   start_local_http
   SKIP_REMOTE_PLAIN_CHECK=1
   start_remote_forward
-  restart_remote_codex_app_server
   section "Clean fast repair complete"
   printf 'Run fast validation with: %s verify-fast\n' "$(basename "$0")"
 }

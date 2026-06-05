@@ -34,5 +34,4 @@ Next:
   1. Edit $CONFIG_DIR/config.env
   2. Run: kinit-refresh save-password
   3. Run: kinit-refresh remote-gcp
-     Use kinit-refresh remote-gcp-clean if the remote Codex tunnel is stuck.
 EOF

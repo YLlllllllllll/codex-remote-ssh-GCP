@@ -1,0 +1,3 @@
+interface:
+  display_name: "Codex GCP Repair"
+  short_description: "Repair Codex Remote GCP egress without touching local Codex app state"
