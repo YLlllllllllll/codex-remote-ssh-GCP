@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.example.kinit-refresh</string>
+
+    <!-- 调用统一的 ~/bin/kinit-refresh 脚本,行为与手动执行完全一致 -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>@/bin/kinit-refresh</string>
+    </array>
+
+    <!-- 每 10 分钟高频刷新/探活一次 (600s)
+         token 有效期 24h,即使错过多次也有缓冲
+         StartInterval 在睡眠期间错过的任务,唤醒后会尽快补跑 -->
+    <key>StartInterval</key>
+    <integer>600</integer>
+
+    <!-- 登录/重启后立即执行一次 -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- 错误输出依然单独留一个文件方便调试 -->
+    <key>StandardOutPath</key>
+    <string>/tmp/kinit-refresh.stdout</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/kinit-refresh.stderr</string>
+</dict>
+</plist>

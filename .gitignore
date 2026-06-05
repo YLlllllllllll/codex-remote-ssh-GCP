@@ -1,0 +1,12 @@
+.DS_Store
+*.log
+*.pid
+*.status
+*.stderr
+*.stdout
+*.swp
+config.env
+secrets/
+dist/
+build/
+.tmp/

@@ -1,0 +1,2 @@
+# Replace <mac-username> before installing with visudo.
+<mac-username> ALL=(root) NOPASSWD: /usr/local/sbin/codex-gcp-route-fix

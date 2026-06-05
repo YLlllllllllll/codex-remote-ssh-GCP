@@ -1,0 +1,615 @@
+#!/bin/bash
+# kinit-refresh — 刷新 Kerberos ticket (REALM.COM)
+#
+# 用法:
+#   kinit-refresh           # 刷新 ticket
+#   kinit-refresh status    # 查看当前 ticket 状态
+#   kinit-refresh log       # 查看最近的自动刷新日志
+#   kinit-refresh save-password  # 保存 kinit 密码到 macOS Keychain
+#
+# 此脚本同时被 ~/Library/LaunchAgents/com.example.kinit-refresh.plist
+# 调用,因此手动执行和定时执行行为完全一致。
+
+export PATH="$HOME/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/opt/homebrew/share/google-cloud-sdk/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+CONFIG_FILE="${KINIT_REFRESH_CONFIG:-$HOME/.config/codex-gcp-refresh/config.env}"
+if [ -f "$CONFIG_FILE" ]; then
+    # shellcheck disable=SC1090
+    . "$CONFIG_FILE"
+fi
+
+PRINCIPAL="${PRINCIPAL:-user.name@REALM.EXAMPLE}"
+LOG_FILE="/tmp/kinit-refresh.log"
+STATUS_FILE="/tmp/kinit-refresh.status"
+LOCK_DIR="/tmp/kinit-refresh.lock"
+KINIT_TIMEOUT_SECONDS=45
+COMMAND_TIMEOUT_SECONDS=20
+CODEX_TIMEOUT_SECONDS=240
+KILL_GRACE_SECONDS=3
+MAX_ATTEMPTS=2
+RETRY_DELAY_SECONDS=15
+LOCK_STALE_SECONDS=600
+KINIT_KEYCHAIN_SERVICE="${KINIT_KEYCHAIN_SERVICE:-example-kinit-refresh}"
+KINIT_KEYCHAIN_ACCOUNT="${KINIT_KEYCHAIN_ACCOUNT:-$PRINCIPAL}"
+JUMP_PROXY_SERVICE="${JUMP_PROXY_SERVICE:-host/jump-proxy.example.com@REALM.EXAMPLE}"
+SSH_PROBE_TARGET="${SSH_PROBE_TARGET:-remote-workspace}"
+CODEX_REFRESH_SCRIPT="${CODEX_REFRESH_SCRIPT:-$HOME/bin/codex-gcp-remote}"
+
+log() {
+    local ts
+    ts=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[${ts}] $*" >> "$LOG_FILE"
+    [ -t 1 ] && echo "[${ts}] $*"
+}
+
+write_status() {
+    local status=$1
+    local ssh_status=$2
+    local proxy_status=$3
+    local codex_status=$4
+    local exp=$5
+    local message=$6
+    local tmp_file="${STATUS_FILE}.$$"
+
+    {
+        echo "STATUS=${status}"
+        echo "SSH=${ssh_status}"
+        echo "PROXY=${proxy_status}"
+        echo "CODEX=${codex_status}"
+        echo "EXP=${exp}"
+        echo "MESSAGE=${message}"
+        echo "UPDATED=$(date '+%Y-%m-%d %H:%M:%S')"
+        echo "UPDATED_EPOCH=$(date '+%s')"
+    } > "$tmp_file"
+    mv "$tmp_file" "$STATUS_FILE"
+}
+
+cleanup() {
+    rm -f "${LOCK_DIR}/pid" 2>/dev/null || true
+    rmdir "$LOCK_DIR" 2>/dev/null || true
+}
+
+kill_process_tree() {
+    local signal=$1
+    local pid=$2
+    local child
+
+    for child in $(pgrep -P "$pid" 2>/dev/null || true); do
+        kill_process_tree "$signal" "$child"
+    done
+
+    kill "-${signal}" "$pid" 2>/dev/null || true
+}
+
+wait_until_exited() {
+    local pid=$1
+    local timeout_seconds=$2
+    local elapsed=0
+
+    while kill -0 "$pid" 2>/dev/null; do
+        if [ "$elapsed" -ge "$timeout_seconds" ]; then
+            return 1
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+
+    return 0
+}
+
+terminate_process_tree() {
+    local pid=$1
+
+    kill_process_tree TERM "$pid"
+    if ! wait_until_exited "$pid" "$KILL_GRACE_SECONDS"; then
+        kill_process_tree KILL "$pid"
+    fi
+    wait "$pid" 2>/dev/null || true
+}
+
+ssh_control_path_for() {
+    local host=$1
+    local path
+
+    path=$(/usr/bin/ssh -G "$host" 2>/dev/null | awk '/^controlpath / { print $2; exit }')
+    case "$path" in
+        "~/"*) path="${HOME}/${path#~/}" ;;
+    esac
+    printf '%s\n' "$path"
+}
+
+reset_ssh_control_masters() {
+    local host path pid
+
+    log "清理可能失效的 SSH ControlMaster"
+    for host in "$SSH_PROBE_TARGET" "jump-proxy.example.com"; do
+        path=$(ssh_control_path_for "$host")
+        [ -n "$path" ] || continue
+
+        /usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=3 -S "$path" -O exit "$host" >/dev/null 2>&1 &
+        pid=$!
+        if ! wait_until_exited "$pid" 4; then
+            terminate_process_tree "$pid"
+        else
+            wait "$pid" 2>/dev/null || true
+        fi
+
+        ps -axo pid=,command= | awk -v p="$path" 'index($0, p) && index($0, "[mux]") { print $1 }' |
+            while IFS= read -r pid; do
+                [ -n "$pid" ] || continue
+                terminate_process_tree "$pid"
+            done
+
+        rm -f "$path" 2>/dev/null || true
+    done
+}
+
+acquire_lock() {
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+        echo "$$" > "${LOCK_DIR}/pid"
+        return 0
+    fi
+
+    local now lock_mtime lock_age
+    now=$(date +%s)
+    lock_mtime=$(stat -f %m "$LOCK_DIR" 2>/dev/null || echo 0)
+    lock_age=$((now - lock_mtime))
+
+    if [ "$lock_age" -gt "$LOCK_STALE_SECONDS" ]; then
+        log "发现过期锁 ${LOCK_DIR} (${lock_age}s), 自动清理"
+        rm -rf "$LOCK_DIR"
+        if mkdir "$LOCK_DIR" 2>/dev/null; then
+            echo "$$" > "${LOCK_DIR}/pid"
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+run_kinit_with_timeout() {
+    local keychain_password
+    keychain_password=$(/usr/bin/security find-generic-password \
+        -a "$KINIT_KEYCHAIN_ACCOUNT" \
+        -s "$KINIT_KEYCHAIN_SERVICE" \
+        -w 2>/dev/null || true)
+
+    if [ -n "$keychain_password" ]; then
+        (printf '%s\n' "$keychain_password" | /usr/bin/kinit "$PRINCIPAL" >/dev/null 2>&1) &
+    else
+        /usr/bin/kinit "$PRINCIPAL" </dev/null &
+    fi
+    local pid=$!
+    local elapsed=0
+
+    while kill -0 "$pid" 2>/dev/null; do
+        if [ "$elapsed" -ge "$KINIT_TIMEOUT_SECONDS" ]; then
+            terminate_process_tree "$pid"
+            return 124
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+
+    wait "$pid"
+}
+
+keychain_password_available() {
+    /usr/bin/security find-generic-password \
+        -a "$KINIT_KEYCHAIN_ACCOUNT" \
+        -s "$KINIT_KEYCHAIN_SERVICE" \
+        -w >/dev/null 2>&1
+}
+
+save_keychain_password() {
+    echo "将保存 ${KINIT_KEYCHAIN_ACCOUNT} 的 kinit 密码到 macOS Keychain。"
+    echo "密码不会写入脚本或 shell 历史。"
+
+    local password=""
+    local rc
+    if [ -t 0 ] && [ -t 1 ]; then
+        echo "下一步会由 security 交互式隐藏输入。"
+        /usr/bin/security add-generic-password -U \
+            -a "$KINIT_KEYCHAIN_ACCOUNT" \
+            -s "$KINIT_KEYCHAIN_SERVICE" \
+            -l "Bytedance kinit-refresh password" \
+            -j "Used by $HOME/bin/kinit-refresh to refresh Kerberos ticket" \
+            -w
+        rc=$?
+    else
+        if ! command -v osascript >/dev/null 2>&1; then
+            echo "当前没有交互式终端, 且 osascript 不可用; 请在 Terminal 中运行: kinit-refresh save-password" >&2
+            return 1
+        fi
+        password=$(/usr/bin/osascript \
+            -e 'display dialog "输入 REALM Kerberos 密码，保存到 macOS Keychain。" default answer "" with hidden answer buttons {"取消", "保存"} default button "保存" cancel button "取消" with title "kinit-refresh"' \
+            -e 'text returned of result')
+        rc=$?
+        if [ "$rc" -ne 0 ] || [ -z "$password" ]; then
+            echo "已取消保存。" >&2
+            return 1
+        fi
+        /usr/bin/security add-generic-password -U \
+            -a "$KINIT_KEYCHAIN_ACCOUNT" \
+            -s "$KINIT_KEYCHAIN_SERVICE" \
+            -l "Bytedance kinit-refresh password" \
+            -j "Used by $HOME/bin/kinit-refresh to refresh Kerberos ticket" \
+            -w "$password"
+        rc=$?
+    fi
+
+    if [ "$rc" -ne 0 ]; then
+        echo "保存失败: security 退出码 ${rc}" >&2
+        password=""
+        return "$rc"
+    fi
+
+    echo "已保存到 Keychain, 正在验证 kinit..."
+    if [ -n "$password" ]; then
+        (printf '%s\n' "$password" | /usr/bin/kinit "$PRINCIPAL" >/dev/null 2>&1)
+    else
+        run_kinit_with_timeout
+    fi
+    rc=$?
+    password=""
+    if [ "$rc" -ne 0 ]; then
+        echo "验证失败: kinit 退出码 ${rc}; 已删除刚保存的 Keychain 项" >&2
+        /usr/bin/security delete-generic-password \
+            -a "$KINIT_KEYCHAIN_ACCOUNT" \
+            -s "$KINIT_KEYCHAIN_SERVICE" >/dev/null 2>&1 || true
+        return "$rc"
+    fi
+
+    echo "验证成功。以后 kinit-refresh 会自动使用 Keychain 中的密码。"
+}
+
+delete_keychain_password() {
+    /usr/bin/security delete-generic-password \
+        -a "$KINIT_KEYCHAIN_ACCOUNT" \
+        -s "$KINIT_KEYCHAIN_SERVICE" >/dev/null 2>&1 || true
+    echo "已删除 Keychain 中的 kinit-refresh 密码项。"
+}
+
+run_with_timeout() {
+    local timeout_seconds=$1
+    shift
+    local output_file="/tmp/kinit-refresh-command.$$.$RANDOM.log"
+
+    "$@" >"$output_file" 2>&1 </dev/null &
+    local pid=$!
+    local elapsed=0
+
+    while kill -0 "$pid" 2>/dev/null; do
+        if [ "$elapsed" -ge "$timeout_seconds" ]; then
+            terminate_process_tree "$pid"
+            log_command_output "$output_file"
+            rm -f "$output_file"
+            return 124
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+
+    wait "$pid"
+    local rc=$?
+    log_command_output "$output_file"
+    rm -f "$output_file"
+    return "$rc"
+}
+
+log_command_output() {
+    local output_file=$1
+
+    if [ -s "$output_file" ]; then
+        while IFS= read -r line; do
+            log "  ${line}"
+        done < "$output_file"
+    fi
+}
+
+verify_ssh_chain() {
+    log "预取跳板服务票据: ${JUMP_PROXY_SERVICE}"
+    run_with_timeout "$COMMAND_TIMEOUT_SECONDS" /usr/bin/kgetcred "$JUMP_PROXY_SERVICE"
+    local rc=$?
+    if [ "$rc" -ne 0 ]; then
+        log "失败, kgetcred 退出码 ${rc}"
+        return "$rc"
+    fi
+
+    log "验证 SSH 链路: ${SSH_PROBE_TARGET}"
+    run_with_timeout "$COMMAND_TIMEOUT_SECONDS" /usr/bin/ssh \
+        -o BatchMode=yes \
+        -o ConnectTimeout=8 \
+        -o ConnectionAttempts=1 \
+        -o ControlMaster=no \
+        -S none \
+        -o ServerAliveInterval=5 \
+        -o ServerAliveCountMax=1 \
+        "$SSH_PROBE_TARGET" true
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        log "失败, SSH 链路验证退出码 ${rc}"
+        reset_ssh_control_masters
+        return "$rc"
+    fi
+
+    return 0
+}
+
+verify_codex_chain() {
+    if [ ! -x "$CODEX_REFRESH_SCRIPT" ]; then
+        log "失败, Codex 修复脚本不存在或不可执行: $CODEX_REFRESH_SCRIPT"
+        return 127
+    fi
+
+    log "修复 Codex 远端代理链路: ${CODEX_REFRESH_SCRIPT} repair"
+    run_with_timeout "$CODEX_TIMEOUT_SECONDS" "$CODEX_REFRESH_SCRIPT" repair
+    local rc=$?
+    if [ "$rc" -ne 0 ]; then
+        log "失败, Codex 远端代理链路修复退出码 ${rc}"
+        reset_ssh_control_masters
+        return "$rc"
+    fi
+
+    log "验证 Codex 远端直连启动与 openai-ok: ${CODEX_REFRESH_SCRIPT} verify"
+    run_with_timeout "$CODEX_TIMEOUT_SECONDS" "$CODEX_REFRESH_SCRIPT" verify
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        log "失败, Codex 远端直连验证退出码 ${rc}"
+        reset_ssh_control_masters
+        return "$rc"
+    fi
+
+    return 0
+}
+
+verify_codex_chain_fast() {
+    if [ ! -x "$CODEX_REFRESH_SCRIPT" ]; then
+        log "失败, Codex 修复脚本不存在或不可执行: $CODEX_REFRESH_SCRIPT"
+        return 127
+    fi
+
+    log "快速修复 Codex Remote GCP 链路: ${CODEX_REFRESH_SCRIPT} repair-fast"
+    run_with_timeout "$CODEX_TIMEOUT_SECONDS" "$CODEX_REFRESH_SCRIPT" repair-fast
+    local rc=$?
+    if [ "$rc" -ne 0 ]; then
+        log "失败, Codex Remote GCP 快速修复退出码 ${rc}"
+        reset_ssh_control_masters
+        return "$rc"
+    fi
+
+    log "快速验证 Codex Remote GCP 出海: ${CODEX_REFRESH_SCRIPT} verify-fast"
+    run_with_timeout "$CODEX_TIMEOUT_SECONDS" "$CODEX_REFRESH_SCRIPT" verify-fast
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        log "失败, Codex Remote GCP 快速验证退出码 ${rc}"
+        reset_ssh_control_masters
+        return "$rc"
+    fi
+
+    return 0
+}
+
+case "${1:-}" in
+    status)
+        klist 2>&1
+        rc=$?
+        if [ -f "$STATUS_FILE" ]; then
+            echo
+            cat "$STATUS_FILE"
+        fi
+        exit $rc
+        ;;
+    log)
+        if [ -f "$LOG_FILE" ]; then
+            tail -n 50 "$LOG_FILE"
+        else
+            echo "暂无日志: $LOG_FILE"
+        fi
+        exit 0
+        ;;
+    save-password|store-password|keychain-save)
+        save_keychain_password
+        exit $?
+        ;;
+    delete-password|forget-password|keychain-delete)
+        delete_keychain_password
+        exit 0
+        ;;
+    ssh|ssh-only|refresh-ssh)
+        MODE="ssh-only"
+        ;;
+    gcp|remote-gcp|codex-gcp|refresh-gcp)
+        MODE="remote-gcp"
+        ;;
+    gcp-full|remote-gcp-full|codex-gcp-full|refresh-gcp-full)
+        MODE="remote-gcp-full"
+        ;;
+    "")
+        MODE="full"
+        ;;
+    *)
+        echo "Usage: kinit-refresh [status|log|save-password|delete-password|ssh-only|remote-gcp|remote-gcp-full]" >&2
+        exit 2
+        ;;
+esac
+
+if ! acquire_lock; then
+    RUNNING_PID=$(cat "${LOCK_DIR}/pid" 2>/dev/null || echo "unknown")
+    log "已有刷新任务在运行(pid=${RUNNING_PID}), 本次跳过"
+    write_status "running" "unknown" "unknown" "unknown" "" "已有刷新任务在运行(pid=${RUNNING_PID})"
+    [ -t 1 ] && echo "已有刷新任务在运行, 本次跳过"
+    exit 0
+fi
+
+trap cleanup EXIT
+
+if [ "$MODE" = "ssh-only" ]; then
+    EXP=$(klist 2>/dev/null | awk '/krbtgt/ {print $5, $6, $7, $8; exit}')
+    log "kinit-refresh SSH-only 启动 (attempts=${MAX_ATTEMPTS}, command_timeout=${COMMAND_TIMEOUT_SECONDS}s, ssh_probe=${SSH_PROBE_TARGET})"
+    write_status "running" "checking" "skipped" "skipped" "$EXP" "正在验证与刷新 SSH 链路"
+
+    if keychain_password_available; then
+        log "检测到 Keychain 中的 kinit 密码, 先刷新 Kerberos ticket"
+        run_kinit_with_timeout
+        RC=$?
+        if [ "$RC" -ne 0 ]; then
+            log "SSH-only 失败, kinit 刷新退出码 ${RC}"
+            write_status "fail" "fail" "skipped" "skipped" "$EXP" "kinit 刷新失败, 退出码 ${RC}"
+            exit "$RC"
+        fi
+        EXP=$(klist 2>/dev/null | awk '/krbtgt/ {print $5, $6, $7, $8; exit}')
+        write_status "running" "checking" "skipped" "skipped" "$EXP" "ticket 已刷新, 正在验证 SSH 链路"
+    elif ! klist -s 2>/dev/null; then
+        log "SSH-only 失败, 当前无有效 Kerberos ticket; 请在终端手动执行 kinit"
+        write_status "fail" "no_ticket" "skipped" "skipped" "$EXP" "无有效 Kerberos ticket; 请在终端手动 kinit"
+        exit 1
+    else
+        log "未检测到 Keychain kinit 密码, 使用当前有效 ticket 验证 SSH"
+    fi
+
+    attempt=1
+    RC=1
+    while [ "$attempt" -le "$MAX_ATTEMPTS" ]; do
+        log "第 ${attempt}/${MAX_ATTEMPTS} 次 SSH 刷新尝试"
+        verify_ssh_chain
+        RC=$?
+        if [ "$RC" -eq 0 ]; then
+            log "成功, 当前 Kerberos ticket 与 SSH 链路均可用; 未刷新 Codex Remote GCP"
+            write_status "ok" "ok" "skipped" "skipped" "$EXP" "SSH 链路可用; 未检查 Codex Remote GCP"
+            [ -t 1 ] && echo "SSH 刷新成功, ticket 有效期至: ${EXP}"
+            exit 0
+        fi
+
+        if [ "$RC" -eq 124 ]; then
+            log "注意: SSH 链路探活超时, 将快速重试"
+            write_status "warning" "timeout" "skipped" "skipped" "$EXP" "SSH 链路探活超时"
+        else
+            log "注意: SSH 链路探活失败, 将快速重试"
+            write_status "warning" "fail" "skipped" "skipped" "$EXP" "SSH 链路探活失败"
+        fi
+
+        if [ "$attempt" -lt "$MAX_ATTEMPTS" ]; then
+            log "${RETRY_DELAY_SECONDS}s 后重试"
+            sleep "$RETRY_DELAY_SECONDS"
+        fi
+
+        attempt=$((attempt + 1))
+    done
+
+    log "SSH-only 最终失败, 已完成 ${MAX_ATTEMPTS} 次尝试"
+    write_status "fail" "fail" "skipped" "skipped" "$EXP" "SSH 刷新最终失败"
+    [ -t 1 ] && echo "SSH 刷新失败 (exit ${RC}), 详见 ${LOG_FILE}"
+    exit "$RC"
+fi
+
+if [ "$MODE" = "remote-gcp" ] || [ "$MODE" = "remote-gcp-full" ]; then
+    EXP=$(klist 2>/dev/null | awk '/krbtgt/ {print $5, $6, $7, $8; exit}')
+    log "kinit-refresh Remote-GCP 启动 (mode=${MODE}, codex_timeout=${CODEX_TIMEOUT_SECONDS}s, ssh_probe=${SSH_PROBE_TARGET})"
+    write_status "running" "checking" "checking" "checking" "$EXP" "正在刷新 Codex Remote GCP 链路"
+
+    if [ "$MODE" = "remote-gcp-full" ]; then
+        verify_ssh_chain
+        RC=$?
+        if [ "$RC" -ne 0 ]; then
+            log "Remote-GCP full 失败, SSH 链路不可用, 退出码 ${RC}; 可先执行 SSH 刷新"
+            write_status "fail" "fail" "unknown" "unknown" "$EXP" "SSH 链路不可用; 请先刷新 SSH"
+            exit "$RC"
+        fi
+
+        write_status "running" "ok" "checking" "checking" "$EXP" "SSH 可用, 正在执行完整 Codex Remote GCP repair+verify"
+        verify_codex_chain
+    else
+        # Fast path intentionally skips the separate SSH probe and full codex exec.
+        # codex-gcp-remote already exercises SSH while repairing 10800, then
+        # verifies ChatGPT reachability through the remote proxy.
+        write_status "running" "checking" "checking" "checking" "$EXP" "正在快速执行 Codex Remote GCP repair+verify"
+        verify_codex_chain_fast
+    fi
+    RC=$?
+    if [ "$RC" -eq 0 ]; then
+        log "成功, Codex Remote GCP ${MODE} repair+verify 均可用"
+        write_status "ok" "ok" "ok" "ok" "$EXP" "Codex Remote GCP ${MODE} 成功"
+        [ -t 1 ] && echo "Remote GCP 刷新成功"
+        exit 0
+    fi
+
+    log "Remote-GCP 失败, Codex repair/verify 退出码 ${RC}"
+    write_status "fail" "ok" "fail" "fail" "$EXP" "Codex Remote GCP repair/verify 失败, 退出码 ${RC}"
+    [ -t 1 ] && echo "Remote GCP 刷新失败 (exit ${RC}), 详见 ${LOG_FILE}"
+    exit "$RC"
+fi
+
+log "kinit-refresh 启动 (principal=${PRINCIPAL}, attempts=${MAX_ATTEMPTS}, kinit_timeout=${KINIT_TIMEOUT_SECONDS}s, command_timeout=${COMMAND_TIMEOUT_SECONDS}s, codex_timeout=${CODEX_TIMEOUT_SECONDS}s, ssh_probe=${SSH_PROBE_TARGET})"
+write_status "running" "checking" "checking" "checking" "" "正在刷新 Kerberos、SSH 与 Codex 链路"
+
+attempt=1
+RC=1
+EXP=""
+while [ "$attempt" -le "$MAX_ATTEMPTS" ]; do
+    STATUS_WRITTEN=0
+    log "第 ${attempt}/${MAX_ATTEMPTS} 次刷新尝试"
+    run_kinit_with_timeout
+    RC=$?
+
+    if [ "$RC" -eq 0 ]; then
+        EXP=$(klist 2>/dev/null | awk '/krbtgt/ {print $5, $6, $7, $8; exit}')
+        log "kinit 成功, ticket 有效期至: ${EXP}"
+        write_status "running" "checking" "checking" "checking" "$EXP" "ticket 已刷新, 正在验证 SSH 链路"
+
+        verify_ssh_chain
+        RC=$?
+        if [ "$RC" -eq 0 ]; then
+            log "SSH 链路可用, 继续验证 Codex 出海链路"
+            write_status "running" "ok" "checking" "checking" "$EXP" "ticket 已刷新, SSH 可用, 正在验证 Codex 出海链路"
+
+            verify_codex_chain
+            RC=$?
+            if [ "$RC" -eq 0 ]; then
+                log "成功, Kerberos ticket、SSH 链路与 Codex 出海链路均可用"
+                write_status "ok" "ok" "ok" "ok" "$EXP" "Kerberos、SSH 与 Codex 出海链路均可用"
+                [ -t 1 ] && echo "刷新成功, 远端 SSH 与 Codex 均可用, ticket 有效期至: ${EXP}"
+                exit 0
+            fi
+
+            if [ "$RC" -eq 124 ]; then
+                log "注意: ticket 与 SSH 已可用, 但 Codex 出海链路探活超时, 将快速重试"
+                write_status "warning" "ok" "fail" "fail" "$EXP" "ticket 与 SSH 可用, 但 Codex 出海链路探活超时"
+            else
+                log "注意: ticket 与 SSH 已可用, 但 Codex 出海链路探活失败, 将快速重试"
+                write_status "warning" "ok" "fail" "fail" "$EXP" "ticket 与 SSH 可用, 但 Codex 出海链路失败"
+            fi
+        else
+            if [ "$RC" -eq 124 ]; then
+                log "注意: ticket 已刷新, 但 SSH 链路探活超时, 将快速重试"
+                write_status "warning" "timeout" "unknown" "unknown" "$EXP" "ticket 已刷新, 但 SSH 链路探活超时"
+            else
+                log "注意: kinit 已成功但 SSH 链路探活失败, 将快速重试; ticket 仍已刷新"
+                write_status "warning" "fail" "unknown" "unknown" "$EXP" "ticket 已刷新, 但 SSH 链路探活失败"
+            fi
+        fi
+        STATUS_WRITTEN=1
+    fi
+
+    if [ "$STATUS_WRITTEN" -eq 0 ]; then
+        if [ "$RC" -eq 124 ]; then
+            log "失败, 命令超过超时时间未返回, 已终止"
+            write_status "fail" "timeout" "unknown" "unknown" "$EXP" "刷新或链路探活超时"
+        else
+            log "失败, 退出码 ${RC}"
+            write_status "fail" "fail" "fail" "fail" "$EXP" "刷新失败, 退出码 ${RC}"
+        fi
+    fi
+
+    if [ "$attempt" -lt "$MAX_ATTEMPTS" ]; then
+        log "${RETRY_DELAY_SECONDS}s 后重试"
+        sleep "$RETRY_DELAY_SECONDS"
+    fi
+
+    attempt=$((attempt + 1))
+done
+
+log "最终失败, 已完成 ${MAX_ATTEMPTS} 次尝试"
+write_status "fail" "fail" "fail" "fail" "$EXP" "最终失败, 已完成 ${MAX_ATTEMPTS} 次尝试"
+[ -t 1 ] && echo "刷新失败 (exit ${RC}), 详见 ${LOG_FILE}"
+exit "$RC"

@@ -1,0 +1,920 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# codex-gcp-remote
+#
+# Background
+# ----------
+# This machine uses Codex App / Codex CLI Remote connections to reach the
+# company remote devbox `remote-workspace` as user tiger. The remote devbox
+# cannot reliably reach ChatGPT/OpenAI directly, so only official Codex traffic
+# should go through a GCP VM as an overseas egress.
+#
+# Fixed intended chain:
+#
+#   local 127.0.0.1:1080 SOCKS
+#     -> ssh -D over GCP 203.0.113.10:443
+#     -> GCP egress
+#
+#   local 127.0.0.1:7890 HTTP
+#     -> privoxy
+#     -> local 127.0.0.1:1080 SOCKS
+#
+#   remote 127.0.0.1:10800 HTTP
+#     -> ssh -R
+#     -> local 127.0.0.1:7890 HTTP
+#
+#   remote official Codex
+#     -> http://127.0.0.1:10800
+#     -> GCP egress
+#     -> chatgpt.com
+#
+# Guardrails
+# ----------
+# - Do not use TUN.
+# - Do not set macOS system proxy.
+# - Do not write global shell HTTP_PROXY/HTTPS_PROXY.
+# - Do not use 18080 or 18081.
+# - Do not route git/npm/pip/browser/general shell traffic through GCP.
+# - Do not use ModelHub/Azure/custom provider for the main path.
+#
+# Why this script exists
+# ----------------------
+# The failure mode that prompted this script was not a GCP egress issue. Old
+# Codex app-server/wrapper state kept reintroducing .codex-gcp and 18080. Also,
+# remote 10800 could be listening but disconnected at the SSH data plane. This
+# script therefore repairs all layers and installs both an outer wrapper
+# (~/.local/bin/codex-gcp) and an inner guard (~/.local/node/bin/codex). The
+# inner guard is deliberate: even if an old outer wrapper is written back by
+# Codex App startup, the final official Codex entry still forces CODEX_HOME
+# and proxy variables back to the correct 10800 route.
+
+LOCAL_USER="$(id -un)"
+LOCAL_HOME="${LOCAL_HOME:-$(dscl . -read "/Users/${LOCAL_USER}" NFSHomeDirectory 2>/dev/null | awk '{ print $2; exit }')}"
+LOCAL_HOME="${LOCAL_HOME:-$HOME}"
+
+CONFIG_FILE="${CODEX_GCP_REFRESH_CONFIG:-$LOCAL_HOME/.config/codex-gcp-refresh/config.env}"
+if [[ -f "$CONFIG_FILE" ]]; then
+  # shellcheck disable=SC1090
+  . "$CONFIG_FILE"
+fi
+
+GCP_HOST="${GCP_HOST:-203.0.113.10}"
+GCP_USER="${GCP_USER:-gcp-user}"
+GCP_PORT="${GCP_PORT:-443}"
+GCP_KEY="${GCP_KEY:-$LOCAL_HOME/.ssh/google_compute_engine}"
+GCP_EXPECTED_IP="${GCP_EXPECTED_IP:-203.0.113.10}"
+
+REMOTE_HOST="${REMOTE_HOST:-remote-workspace}"
+REMOTE_HOME="${REMOTE_HOME:-/home/tiger}"
+
+LOCAL_SOCKS_HOST="${LOCAL_SOCKS_HOST:-127.0.0.1}"
+LOCAL_SOCKS_PORT="${LOCAL_SOCKS_PORT:-1080}"
+LOCAL_HTTP_HOST="${LOCAL_HTTP_HOST:-127.0.0.1}"
+LOCAL_HTTP_PORT="${LOCAL_HTTP_PORT:-7890}"
+REMOTE_HTTP_HOST="${REMOTE_HTTP_HOST:-127.0.0.1}"
+REMOTE_HTTP_PORT="${REMOTE_HTTP_PORT:-10800}"
+IP_CHECK_TIMEOUT="${IP_CHECK_TIMEOUT:-15}"
+IP_CHECK_URL="${IP_CHECK_URL:-https://api.ipify.org}"
+CHATGPT_CODEX_URL="${CHATGPT_CODEX_URL:-https://chatgpt.com/backend-api/codex/responses}"
+SKIP_REMOTE_PLAIN_CHECK="${SKIP_REMOTE_PLAIN_CHECK:-0}"
+SSH_CONNECT_TIMEOUT="${SSH_CONNECT_TIMEOUT:-8}"
+REMOTE_FORWARD_VERIFY_ATTEMPTS="${REMOTE_FORWARD_VERIFY_ATTEMPTS:-8}"
+REMOTE_FORWARD_VERIFY_DELAY="${REMOTE_FORWARD_VERIFY_DELAY:-2}"
+VERIFY_FAST_ATTEMPTS="${VERIFY_FAST_ATTEMPTS:-6}"
+VERIFY_FAST_DELAY="${VERIFY_FAST_DELAY:-2}"
+STALE_REMOTE_SSHD_MIN_AGE="${STALE_REMOTE_SSHD_MIN_AGE:-5}"
+
+STATE_DIR="${STATE_DIR:-$LOCAL_HOME/.codex-gcp-tunnel}"
+PRIVOXY_CONF="$STATE_DIR/privoxy.conf"
+REMOTE_CONTROL_PATH="$STATE_DIR/remote-forward.cm"
+
+LOCAL_SOCKS_URL="socks5h://${LOCAL_SOCKS_HOST}:${LOCAL_SOCKS_PORT}"
+LOCAL_HTTP_URL="http://${LOCAL_HTTP_HOST}:${LOCAL_HTTP_PORT}"
+REMOTE_HTTP_URL="http://${REMOTE_HTTP_HOST}:${REMOTE_HTTP_PORT}"
+
+usage() {
+  cat <<EOF
+Usage: $(basename "$0") <command>
+
+Commands:
+  diagnose   Print local/remote tunnel, wrapper, process, and config state.
+  repair     Ensure local 1080, local 7890, remote 10800, and remote Codex wrappers.
+  repair-fast
+             Ensure only local 1080, local 7890, and remote 10800.
+  verify     Run direct SSH remote Codex validation, including openai-ok.
+  verify-fast
+             Verify remote 10800 egress and ChatGPT endpoint reachability.
+  status     Alias for diagnose.
+
+Examples:
+  $(basename "$0") diagnose
+  $(basename "$0") repair
+  $(basename "$0") verify
+
+Fixed ports:
+  local SOCKS  ${LOCAL_SOCKS_HOST}:${LOCAL_SOCKS_PORT}
+  local HTTP   ${LOCAL_HTTP_HOST}:${LOCAL_HTTP_PORT}
+  remote HTTP  ${REMOTE_HTTP_HOST}:${REMOTE_HTTP_PORT}
+  GCP SSH      ${GCP_USER}@${GCP_HOST}:${GCP_PORT}
+EOF
+}
+
+section() {
+  printf '\n== %s ==\n' "$1"
+}
+
+have() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+privoxy_bin() {
+  if have privoxy; then
+    command -v privoxy
+    return
+  fi
+  if [[ -x /opt/homebrew/opt/privoxy/sbin/privoxy ]]; then
+    printf '%s\n' /opt/homebrew/opt/privoxy/sbin/privoxy
+    return
+  fi
+  if [[ -x /usr/local/opt/privoxy/sbin/privoxy ]]; then
+    printf '%s\n' /usr/local/opt/privoxy/sbin/privoxy
+    return
+  fi
+  return 1
+}
+
+listener_pids() {
+  lsof -tiTCP:"$1" -sTCP:LISTEN 2>/dev/null || true
+}
+
+kill_listeners() {
+  local port="$1"
+  local pids
+  pids="$(listener_pids "$port")"
+  if [[ -n "$pids" ]]; then
+    printf 'Killing listeners on %s: %s\n' "$port" "$pids"
+    # shellcheck disable=SC2086
+    kill $pids 2>/dev/null || true
+    sleep 1
+  fi
+}
+
+curl_ip_direct() {
+  curl -sS --connect-timeout 3 --max-time "$IP_CHECK_TIMEOUT" "$IP_CHECK_URL" 2>/dev/null || true
+}
+
+curl_ip_local_socks() {
+  ALL_PROXY="$LOCAL_SOCKS_URL" curl -sS --connect-timeout 3 --max-time "$IP_CHECK_TIMEOUT" "$IP_CHECK_URL" 2>/dev/null || true
+}
+
+curl_ip_local_http() {
+  curl -sS --connect-timeout 3 --max-time "$IP_CHECK_TIMEOUT" -x "$LOCAL_HTTP_URL" "$IP_CHECK_URL" 2>/dev/null || true
+}
+
+retry_ip_probe() {
+  local probe="$1"
+  local attempts="${2:-5}"
+  local delay="${3:-2}"
+  local ip=""
+  local i
+
+  for i in $(seq 1 "$attempts"); do
+    ip="$("$probe")"
+    if [[ "$ip" == "$GCP_EXPECTED_IP" ]]; then
+      printf '%s\n' "$ip"
+      return 0
+    fi
+    sleep "$delay"
+  done
+
+  printf '%s\n' "$ip"
+  return 1
+}
+
+route_field() {
+  local target="$1"
+  local field="$2"
+  route -n get "$target" 2>/dev/null | awk -v f="$field" '$1 == f ":" { print $2; exit }'
+}
+
+ensure_gcp_host_route() {
+  local iface gateway current_gateway
+
+  iface="$(route_field "$GCP_HOST" interface)"
+  gateway="$(route_field default gateway)"
+  current_gateway="$(route_field "$GCP_HOST" gateway)"
+
+  if [[ "$iface" != utun* && ( -z "$current_gateway" || "$current_gateway" == "$gateway" ) ]]; then
+    return 0
+  fi
+  if [[ -z "$gateway" || "$gateway" == link#* ]]; then
+    printf 'WARNING: GCP route uses %s/%s, but no usable default gateway was found for host-route repair\n' "$iface" "$current_gateway" >&2
+    return 0
+  fi
+
+  if [[ "$iface" == utun* ]]; then
+    printf 'GCP route currently uses VPN interface %s; pinning %s via %s\n' "$iface" "$GCP_HOST" "$gateway"
+  else
+    printf 'GCP route currently uses stale gateway %s; pinning %s via current gateway %s\n' "$current_gateway" "$GCP_HOST" "$gateway"
+  fi
+
+  if [[ -x /usr/local/sbin/codex-gcp-route-fix ]] &&
+     sudo -n /usr/local/sbin/codex-gcp-route-fix "$GCP_HOST" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if route -n add -host "$GCP_HOST" "$gateway" >/dev/null 2>&1 ||
+     route -n change -host "$GCP_HOST" "$gateway" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if have osascript; then
+    osascript -e "do shell script \"route -n add -host $GCP_HOST $gateway 2>/dev/null || route -n change -host $GCP_HOST $gateway\" with administrator privileges" >/dev/null 2>&1 || {
+      printf 'WARNING: could not add GCP host route via administrator prompt\n' >&2
+      return 0
+    }
+  else
+    printf 'WARNING: route repair requires admin privileges and osascript is unavailable\n' >&2
+  fi
+}
+
+ssh_remote() {
+  ssh \
+    -o BatchMode=yes \
+    -o ConnectTimeout=10 \
+    -o ConnectionAttempts=1 \
+    -o ServerAliveInterval=5 \
+    -o ServerAliveCountMax=1 \
+    "$REMOTE_HOST" "$@"
+}
+
+ssh_remote_quiet() {
+  ssh \
+    -o BatchMode=yes \
+    -o ConnectTimeout=6 \
+    -o ConnectionAttempts=1 \
+    -o ServerAliveInterval=5 \
+    -o ServerAliveCountMax=1 \
+    "$REMOTE_HOST" "$@" 2>/dev/null
+}
+
+remote_proxy_ip_once() {
+  ssh_remote_quiet "curl -sS --connect-timeout 3 --max-time '$IP_CHECK_TIMEOUT' -x '$REMOTE_HTTP_URL' '$IP_CHECK_URL' 2>/dev/null || true" || true
+}
+
+probe_remote_forward() {
+  local attempts="${1:-$REMOTE_FORWARD_VERIFY_ATTEMPTS}"
+  local delay="${2:-$REMOTE_FORWARD_VERIFY_DELAY}"
+  local ip=""
+  local i
+
+  for i in $(seq 1 "$attempts"); do
+    ip="$(remote_proxy_ip_once)"
+    if [[ "$ip" == "$GCP_EXPECTED_IP" ]]; then
+      printf '%s\n' "$ip"
+      return 0
+    fi
+    sleep "$delay"
+  done
+
+  printf '%s\n' "$ip"
+  return 1
+}
+
+configured_remote_control_path() {
+  local path
+  path="$(ssh -G "$REMOTE_HOST" 2>/dev/null | awk '/^controlpath / { print $2; exit }' || true)"
+  case "$path" in
+    "~/"*) path="${LOCAL_HOME}/${path#~/}" ;;
+  esac
+  printf '%s\n' "$path"
+}
+
+reset_remote_forward_controlmasters() {
+  local configured_control_path
+  configured_control_path="$(configured_remote_control_path)"
+
+  if [[ -n "$configured_control_path" && "$configured_control_path" != "none" ]]; then
+    ssh -S "$configured_control_path" -O cancel \
+      -R "${REMOTE_HTTP_HOST}:${REMOTE_HTTP_PORT}:${LOCAL_HTTP_HOST}:${LOCAL_HTTP_PORT}" \
+      "$REMOTE_HOST" >/dev/null 2>&1 || true
+    ssh -S "$configured_control_path" -O exit "$REMOTE_HOST" >/dev/null 2>&1 || true
+    rm -f "$configured_control_path" 2>/dev/null || true
+  fi
+
+  ssh -S "$REMOTE_CONTROL_PATH" -O exit "$REMOTE_HOST" >/dev/null 2>&1 || true
+  rm -f "$REMOTE_CONTROL_PATH" "$STATE_DIR/remote-forward.manual.log" 2>/dev/null || true
+}
+
+clear_stale_remote_forward_sessions() {
+  ssh_remote "REMOTE_HTTP_PORT='$REMOTE_HTTP_PORT' STALE_REMOTE_SSHD_MIN_AGE='$STALE_REMOTE_SSHD_MIN_AGE' bash -s" <<'REMOTE' || true
+set -Eeuo pipefail
+
+if ! ss -ltn 2>/dev/null | awk -v port="$REMOTE_HTTP_PORT" '$4 ~ ":" port "$" { found=1 } END { exit found ? 0 : 1 }'; then
+  exit 0
+fi
+
+self=$$
+keep=" $self "
+pid="$self"
+while :; do
+  pid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')"
+  [ -n "$pid" ] || break
+  keep="${keep}${pid} "
+  [ "$pid" = "1" ] && break
+done
+
+victims="$(ps -eo pid=,etimes=,args= 2>/dev/null | awk -v keep="$keep" -v min_age="$STALE_REMOTE_SSHD_MIN_AGE" '
+  /sshd: tiger@notty/ {
+    pid=$1
+    age=$2
+    if (age >= min_age && index(keep, " " pid " ") == 0) {
+      print pid
+    }
+  }
+')"
+
+[ -n "$victims" ] || {
+  echo "remote 10800 is stale, but no old sshd tunnel session was safe to kill"
+  exit 0
+}
+
+echo "clearing stale remote 10800 sshd sessions: $(echo "$victims" | tr '\n' ' ')"
+kill $victims 2>/dev/null || true
+sleep 1
+if ss -ltn 2>/dev/null | awk -v port="$REMOTE_HTTP_PORT" '$4 ~ ":" port "$" { found=1 } END { exit found ? 0 : 1 }'; then
+  kill -9 $victims 2>/dev/null || true
+  sleep 1
+fi
+REMOTE
+}
+
+ensure_remote_controlmaster() {
+  local configured_control_path="$1"
+
+  if [[ -n "$configured_control_path" && "$configured_control_path" != "none" && -S "$configured_control_path" ]]; then
+    return 0
+  fi
+
+  ssh \
+    -fN \
+    -M \
+    -S "$configured_control_path" \
+    -E "$STATE_DIR/remote-controlmaster.manual.log" \
+    -o BatchMode=yes \
+    -o ConnectTimeout=10 \
+    -o ConnectionAttempts=1 \
+    -o ServerAliveInterval=15 \
+    -o ServerAliveCountMax=12 \
+    "$REMOTE_HOST" 2>&1 || true
+  sleep 2
+}
+
+request_remote_forward_on_controlmaster() {
+  local control_path="$1"
+
+  [[ -n "$control_path" && "$control_path" != "none" && -S "$control_path" ]] || return 1
+  ssh -S "$control_path" -O check "$REMOTE_HOST" 2>&1 || true
+  ssh -S "$control_path" -O cancel \
+    -R "${REMOTE_HTTP_HOST}:${REMOTE_HTTP_PORT}:${LOCAL_HTTP_HOST}:${LOCAL_HTTP_PORT}" \
+    "$REMOTE_HOST" >/dev/null 2>&1 || true
+  ssh -S "$control_path" -O forward \
+    -R "${REMOTE_HTTP_HOST}:${REMOTE_HTTP_PORT}:${LOCAL_HTTP_HOST}:${LOCAL_HTTP_PORT}" \
+    -o BatchMode=yes \
+    -o ConnectTimeout=10 \
+    -o ConnectionAttempts=1 \
+    -o ExitOnForwardFailure=yes \
+    "$REMOTE_HOST" 2>&1 || true
+}
+
+stop_local_launchd_if_present() {
+  local uid
+  uid="$(id -u)"
+  launchctl bootout "gui/$uid" "$LOCAL_HOME/Library/LaunchAgents/com.example.codex.gcp-socks.plist" 2>/dev/null || true
+  launchctl remove com.example.codex.gcp-socks 2>/dev/null || true
+}
+
+start_local_socks() {
+  section "Ensure local SOCKS ${LOCAL_SOCKS_HOST}:${LOCAL_SOCKS_PORT}"
+  mkdir -p "$STATE_DIR"
+  ensure_gcp_host_route
+
+  local existing_ip
+  existing_ip="$(retry_ip_probe curl_ip_local_socks 2 1 || true)"
+  if [[ -n "$(listener_pids "$LOCAL_SOCKS_PORT")" && "$existing_ip" == "$GCP_EXPECTED_IP" ]]; then
+    printf 'local SOCKS already healthy; reusing existing listener\n'
+    listener_pids "$LOCAL_SOCKS_PORT" | head -n 1 > "$STATE_DIR/gcp-socks.manual.pid"
+    lsof -nP -iTCP:"$LOCAL_SOCKS_PORT" -sTCP:LISTEN
+    printf 'local socks ip: %s\n' "$existing_ip"
+    return
+  fi
+
+  kill_listeners "$LOCAL_SOCKS_PORT"
+
+  ssh -fN \
+    -E "$STATE_DIR/gcp-socks.manual.log" \
+    -i "$GCP_KEY" \
+    -o IdentitiesOnly=yes \
+    -D "${LOCAL_SOCKS_HOST}:${LOCAL_SOCKS_PORT}" \
+    -p "$GCP_PORT" \
+    -o ConnectTimeout="$SSH_CONNECT_TIMEOUT" \
+    -o ConnectionAttempts=1 \
+    -o ServerAliveInterval=30 \
+    -o ServerAliveCountMax=3 \
+    -o ExitOnForwardFailure=yes \
+    "${GCP_USER}@${GCP_HOST}"
+
+  sleep 2
+  local pid
+  pid="$(listener_pids "$LOCAL_SOCKS_PORT" | head -n 1 || true)"
+  if [[ -z "$pid" ]]; then
+    printf 'ERROR: local SOCKS did not start. Log:\n' >&2
+    cat "$STATE_DIR/gcp-socks.manual.log" 2>/dev/null >&2 || true
+    exit 1
+  fi
+  printf '%s\n' "$pid" > "$STATE_DIR/gcp-socks.manual.pid"
+  lsof -nP -iTCP:"$LOCAL_SOCKS_PORT" -sTCP:LISTEN
+
+  local ip
+  ip="$(retry_ip_probe curl_ip_local_socks 5 2 || true)"
+  printf 'local socks ip: %s\n' "$ip"
+  if [[ "$ip" != "$GCP_EXPECTED_IP" ]]; then
+    printf 'ERROR: local SOCKS egress is %s, expected %s\n' "$ip" "$GCP_EXPECTED_IP" >&2
+    kill_listeners "$LOCAL_SOCKS_PORT"
+    exit 1
+  fi
+}
+
+start_local_http() {
+  section "Ensure local HTTP ${LOCAL_HTTP_HOST}:${LOCAL_HTTP_PORT}"
+  mkdir -p "$STATE_DIR"
+
+  local existing_ip
+  existing_ip="$(retry_ip_probe curl_ip_local_http 2 1 || true)"
+  if [[ -n "$(listener_pids "$LOCAL_HTTP_PORT")" && "$existing_ip" == "$GCP_EXPECTED_IP" ]]; then
+    printf 'local HTTP proxy already healthy; reusing existing listener\n'
+    listener_pids "$LOCAL_HTTP_PORT" | head -n 1 > "$STATE_DIR/privoxy.manual.pid"
+    lsof -nP -iTCP:"$LOCAL_HTTP_PORT" -sTCP:LISTEN
+    printf 'local http ip: %s\n' "$existing_ip"
+    return
+  fi
+
+  local bin
+  if ! bin="$(privoxy_bin)"; then
+    printf 'ERROR: privoxy not found. Install it with: brew install privoxy\n' >&2
+    exit 1
+  fi
+
+  cat > "$PRIVOXY_CONF" <<EOF
+listen-address ${LOCAL_HTTP_HOST}:${LOCAL_HTTP_PORT}
+forward-socks5t / ${LOCAL_SOCKS_HOST}:${LOCAL_SOCKS_PORT} .
+toggle 1
+enable-remote-toggle 0
+enable-edit-actions 0
+logdir ${STATE_DIR}
+logfile privoxy-runtime.log
+EOF
+
+  kill_listeners "$LOCAL_HTTP_PORT"
+  "$bin" "$PRIVOXY_CONF"
+  sleep 2
+
+  local pid
+  pid="$(listener_pids "$LOCAL_HTTP_PORT" | head -n 1 || true)"
+  if [[ -z "$pid" ]]; then
+    printf 'ERROR: privoxy did not start.\n' >&2
+    exit 1
+  fi
+  printf '%s\n' "$pid" > "$STATE_DIR/privoxy.manual.pid"
+  lsof -nP -iTCP:"$LOCAL_HTTP_PORT" -sTCP:LISTEN
+
+  local ip
+  ip="$(retry_ip_probe curl_ip_local_http 5 2 || true)"
+  printf 'local http ip: %s\n' "$ip"
+  if [[ "$ip" != "$GCP_EXPECTED_IP" ]]; then
+    printf 'ERROR: local HTTP egress is %s, expected %s\n' "$ip" "$GCP_EXPECTED_IP" >&2
+    kill_listeners "$LOCAL_HTTP_PORT"
+    exit 1
+  fi
+}
+
+restore_remote_official_js_if_needed() {
+  section "Check remote official codex.js"
+  local first
+  first="$(ssh_remote "head -1 '$REMOTE_HOME/.local/node/lib/node_modules/@openai/codex/bin/codex.js' 2>/dev/null || true")"
+  if [[ "$first" == "#!/usr/bin/env node" ]]; then
+    printf 'remote official codex.js is already intact\n'
+    return
+  fi
+
+  printf 'remote codex.js is not official JS; restoring from npm package\n'
+  local version tmp pkg
+  version="$(ssh_remote "sed -n 's/.*\"version\": \"\\([^\"]*\\)\".*/\\1/p' '$REMOTE_HOME/.local/node/lib/node_modules/@openai/codex/package.json' | head -n 1" 2>/dev/null || true)"
+  version="${version:-0.135.0}"
+  tmp="$(mktemp -d /tmp/codex-npm.XXXXXX)"
+  (
+    cd "$tmp"
+    if ! npm pack "@openai/codex@$version" --silent; then
+      HTTP_PROXY="$LOCAL_HTTP_URL" HTTPS_PROXY="$LOCAL_HTTP_URL" npm pack "@openai/codex@$version" --silent
+    fi
+    pkg="$(ls ./*.tgz | head -n 1)"
+    tar -xzf "$pkg" package/bin/codex.js
+  )
+  scp "$tmp/package/bin/codex.js" "$REMOTE_HOST:/tmp/codex.js.official.$version" >/dev/null
+  ssh_remote "install -m 0755 '/tmp/codex.js.official.$version' '$REMOTE_HOME/.local/node/lib/node_modules/@openai/codex/bin/codex.js' && rm -f '/tmp/codex.js.official.$version'"
+  rm -rf "$tmp"
+}
+
+remote_wrappers_healthy() {
+  ssh_remote 'bash -s' <<'REMOTE' >/dev/null 2>&1
+set -Eeuo pipefail
+
+[[ "$(readlink -f "$HOME/.local/bin/codex" 2>/dev/null)" == "$HOME/.local/bin/codex-gcp" ]]
+[[ -x "$HOME/.local/bin/codex-gcp" ]]
+[[ -x "$HOME/.local/node/bin/codex" ]]
+[[ "$(head -1 "$HOME/.local/node/lib/node_modules/@openai/codex/bin/codex.js" 2>/dev/null)" == "#!/usr/bin/env node" ]]
+grep -q 'Inner guard' "$HOME/.local/node/bin/codex"
+grep -q '127\.0\.0\.1:10800' "$HOME/.codex/proxy.env"
+! grep -Eq '127\.0\.0\.1:18080|127\.0\.0\.1:18081|modelhub|azure|OPENAI_BASE_URL|aidp\.example' "$HOME/.codex/proxy.env"
+if [[ -f "$HOME/.codex/config.toml" ]]; then
+  ! grep -Eq 'model_provider|model_providers|OPENAI_BASE_URL|aidp\.example|azure|modelhub|127\.0\.0\.1:18080|127\.0\.0\.1:18081' "$HOME/.codex/config.toml"
+fi
+"$HOME/.local/bin/codex" --version | grep -q '^codex-cli '
+REMOTE
+}
+
+ensure_remote_wrappers() {
+  section "Ensure remote Codex wrappers"
+  if remote_wrappers_healthy; then
+    printf 'remote Codex wrappers already healthy; leaving active app-server untouched\n'
+    ssh_remote "sha256sum '$REMOTE_HOME/.local/bin/codex-gcp' '$REMOTE_HOME/.local/node/bin/codex'; readlink -f '$REMOTE_HOME/.local/bin/codex'; '$REMOTE_HOME/.local/bin/codex' --version"
+    return
+  fi
+
+  restore_remote_official_js_if_needed
+  write_remote_wrappers
+}
+
+write_remote_wrappers() {
+  section "Write remote Codex wrappers"
+  ssh_remote 'bash -s' <<'REMOTE'
+set -Eeuo pipefail
+
+mkdir -p "$HOME/.codex" "$HOME/.local/bin" "$HOME/.local/node/bin"
+
+cat > "$HOME/.codex/proxy.env" <<'EOF'
+CODEX_SSH_PROXY_PORT=10800
+CODEX_PROXY_URL=http://127.0.0.1:10800
+HTTP_PROXY=http://127.0.0.1:10800
+HTTPS_PROXY=http://127.0.0.1:10800
+ALL_PROXY=http://127.0.0.1:10800
+http_proxy=http://127.0.0.1:10800
+https_proxy=http://127.0.0.1:10800
+all_proxy=http://127.0.0.1:10800
+NO_PROXY=localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.corp.example,.example.net,aidp.example.net
+no_proxy=localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.corp.example,.example.net,aidp.example.net
+EOF
+chmod 600 "$HOME/.codex/proxy.env"
+
+if [[ ! -f "$HOME/.codex/auth.json" && -f "$HOME/.codex-gcp/auth.json" ]]; then
+  cp -p "$HOME/.codex-gcp/auth.json" "$HOME/.codex/auth.json"
+  chmod 600 "$HOME/.codex/auth.json"
+fi
+
+if [[ -f "$HOME/.codex/config.toml" ]] && grep -Eq 'model_provider|model_providers|OPENAI_BASE_URL|aidp\.example|azure|modelhub' "$HOME/.codex/config.toml"; then
+  mv "$HOME/.codex/config.toml" "$HOME/.codex/config.toml.disabled.$(date +%Y%m%d%H%M%S)"
+fi
+
+cat > "$HOME/.local/bin/codex-gcp" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+ORIGINAL_CODEX_BIN="${ORIGINAL_CODEX_BIN:-$HOME/.local/node/bin/codex}"
+
+if [[ ! -x "$ORIGINAL_CODEX_BIN" ]]; then
+  echo "ERROR: official Codex binary not found or not executable: $ORIGINAL_CODEX_BIN" >&2
+  exit 1
+fi
+
+# Single official proxy entry: remote 127.0.0.1:10800 only.
+export CODEX_HOME="$HOME/.codex"
+export PATH="$HOME/.local/node/bin:$PATH"
+export CODEX_SSH_PROXY_PORT="10800"
+export CODEX_PROXY_URL="http://127.0.0.1:10800"
+export HTTP_PROXY="http://127.0.0.1:10800"
+export HTTPS_PROXY="http://127.0.0.1:10800"
+export ALL_PROXY="http://127.0.0.1:10800"
+export http_proxy="$HTTP_PROXY"
+export https_proxy="$HTTPS_PROXY"
+export all_proxy="$ALL_PROXY"
+export NO_PROXY="localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.corp.example,.example.net,aidp.example.net"
+export no_proxy="$NO_PROXY"
+unset OPENAI_API_KEY OPENAI_BASE_URL OPENAI_ORG_ID OPENAI_ORGANIZATION OPENAI_PROJECT OPENAI_PROJECT_ID
+
+exec "$ORIGINAL_CODEX_BIN" "$@"
+EOF
+chmod +x "$HOME/.local/bin/codex-gcp"
+ln -sfn "$HOME/.local/bin/codex-gcp" "$HOME/.local/bin/codex"
+
+NODE_CODEX_BIN="$HOME/.local/node/bin/codex"
+if [[ -e "$NODE_CODEX_BIN" || -L "$NODE_CODEX_BIN" ]]; then
+  rm -f "$NODE_CODEX_BIN"
+fi
+cat > "$NODE_CODEX_BIN" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+NODE_BIN="$HOME/.local/node/bin/node"
+CODEX_JS="$HOME/.local/node/lib/node_modules/@openai/codex/bin/codex.js"
+
+if [[ ! -x "$NODE_BIN" ]]; then
+  echo "ERROR: bundled node missing: $NODE_BIN" >&2
+  exit 1
+fi
+if [[ ! -f "$CODEX_JS" ]]; then
+  echo "ERROR: official Codex JS entry missing: $CODEX_JS" >&2
+  exit 1
+fi
+
+# Inner guard: this is the final entry all wrappers reach.
+export CODEX_HOME="$HOME/.codex"
+export PATH="$HOME/.local/node/bin:$PATH"
+export CODEX_SSH_PROXY_PORT="10800"
+export CODEX_PROXY_URL="http://127.0.0.1:10800"
+export HTTP_PROXY="http://127.0.0.1:10800"
+export HTTPS_PROXY="http://127.0.0.1:10800"
+export ALL_PROXY="http://127.0.0.1:10800"
+export http_proxy="$HTTP_PROXY"
+export https_proxy="$HTTPS_PROXY"
+export all_proxy="$ALL_PROXY"
+export NO_PROXY="localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.corp.example,.example.net,aidp.example.net"
+export no_proxy="$NO_PROXY"
+unset OPENAI_API_KEY OPENAI_BASE_URL OPENAI_ORG_ID OPENAI_ORGANIZATION OPENAI_PROJECT OPENAI_PROJECT_ID
+
+exec "$NODE_BIN" "$CODEX_JS" "$@"
+EOF
+chmod +x "$NODE_CODEX_BIN"
+
+sha256sum "$HOME/.local/bin/codex-gcp" "$HOME/.local/node/bin/codex"
+readlink -f "$HOME/.local/bin/codex"
+"$HOME/.local/bin/codex" --version
+REMOTE
+}
+
+kill_stale_remote_processes() {
+  section "Kill stale remote 18080/18081 app-server processes"
+  ssh_remote 'bash -s' <<'REMOTE'
+set -Eeuo pipefail
+
+for pid in $(ps -eo pid=,args= | grep -E 'codex app-server proxy|app-server --listen unix://' | grep -v grep | sed 's/^ *//; s/ .*//'); do
+  if tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep -Eq '127\.0\.0\.1:18080|127\.0\.0\.1:18081|CODEX_HOME=.*/\.codex-gcp'; then
+    echo "killing stale app-server pid=$pid"
+    kill "$pid" 2>/dev/null || true
+  fi
+done
+
+sleep 2
+
+for pid in $(ps -eo pid=,args= | grep -E 'codex app-server proxy|app-server --listen unix://' | grep -v grep | sed 's/^ *//; s/ .*//'); do
+  if tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep -Eq '127\.0\.0\.1:18080|127\.0\.0\.1:18081|CODEX_HOME=.*/\.codex-gcp'; then
+    echo "force killing stale pid=$pid"
+    kill -9 "$pid" 2>/dev/null || true
+  fi
+done
+REMOTE
+}
+
+start_remote_forward() {
+  section "Ensure remote HTTP ${REMOTE_HTTP_HOST}:${REMOTE_HTTP_PORT}"
+  mkdir -p "$STATE_DIR"
+
+  local proxy_ip plain_ip
+  for _ in $(seq 1 3); do
+    proxy_ip="$(ssh_remote "curl -sS --connect-timeout 3 --max-time '$IP_CHECK_TIMEOUT' -x '$REMOTE_HTTP_URL' '$IP_CHECK_URL'" 2>/dev/null || true)"
+    if [[ "$SKIP_REMOTE_PLAIN_CHECK" == "1" ]]; then
+      plain_ip="skipped"
+    else
+      plain_ip="$(ssh_remote "curl -sS --connect-timeout 3 --max-time '$IP_CHECK_TIMEOUT' '$IP_CHECK_URL'" 2>/dev/null || true)"
+    fi
+    [[ "$proxy_ip" == "$GCP_EXPECTED_IP" ]] && break
+    sleep 2
+  done
+  if [[ "$proxy_ip" == "$GCP_EXPECTED_IP" && "$plain_ip" != "$GCP_EXPECTED_IP" ]]; then
+    printf 'remote HTTP forward already healthy; reusing existing listener\n'
+    ssh_remote "ss -ltn 2>/dev/null | egrep ':${REMOTE_HTTP_PORT}|:18080|:18081' || true"
+    printf 'remote proxy ip: %s\n' "$proxy_ip"
+    printf 'remote plain ip: %s\n' "$plain_ip"
+    return
+  fi
+
+  ssh -S "$REMOTE_CONTROL_PATH" -O exit "$REMOTE_HOST" 2>/dev/null || true
+  sleep 1
+  rm -f "$REMOTE_CONTROL_PATH"
+  rm -f "$STATE_DIR/remote-forward.manual.log"
+  clear_stale_remote_forward_sessions
+
+  # The company workspace SSH path drops bare `ssh -fN/-fMN` tunnel masters with
+  # "client_loop: send disconnect: Broken pipe". Prefer the shared ControlMaster
+  # that Codex App / normal SSH sessions already keep alive.
+  local configured_control_path
+  configured_control_path="$(configured_remote_control_path)"
+
+  if [[ -n "$configured_control_path" && "$configured_control_path" != "none" && -S "$configured_control_path" ]]; then
+    printf 'using existing SSH ControlMaster: %s\n' "$configured_control_path"
+    request_remote_forward_on_controlmaster "$configured_control_path"
+  else
+    printf 'no existing SSH ControlMaster found; creating one for remote forward\n'
+    ensure_remote_controlmaster "$configured_control_path"
+    request_remote_forward_on_controlmaster "$configured_control_path"
+  fi
+  sleep 2
+
+  proxy_ip="$(probe_remote_forward "$REMOTE_FORWARD_VERIFY_ATTEMPTS" "$REMOTE_FORWARD_VERIFY_DELAY" || true)"
+  if [[ "$proxy_ip" != "$GCP_EXPECTED_IP" ]]; then
+    printf 'remote forward data plane unhealthy; resetting SSH ControlMaster and retrying\n'
+    reset_remote_forward_controlmasters
+    clear_stale_remote_forward_sessions
+    configured_control_path="$(configured_remote_control_path)"
+    ensure_remote_controlmaster "$configured_control_path"
+    request_remote_forward_on_controlmaster "$configured_control_path"
+    proxy_ip="$(probe_remote_forward "$REMOTE_FORWARD_VERIFY_ATTEMPTS" "$REMOTE_FORWARD_VERIFY_DELAY" || true)"
+  fi
+
+  if [[ "$SKIP_REMOTE_PLAIN_CHECK" == "1" ]]; then
+    plain_ip="skipped"
+  else
+    plain_ip="$(ssh_remote "curl -sS --connect-timeout 3 --max-time '$IP_CHECK_TIMEOUT' '$IP_CHECK_URL'" 2>/dev/null || true)"
+  fi
+  ssh_remote "ss -ltn 2>/dev/null | egrep ':${REMOTE_HTTP_PORT}|:18080|:18081' || true"
+  printf 'remote proxy ip: %s\n' "$proxy_ip"
+  printf 'remote plain ip: %s\n' "$plain_ip"
+
+  if [[ "$proxy_ip" != "$GCP_EXPECTED_IP" ]]; then
+    printf 'ERROR: remote proxy egress is %s, expected %s\n' "$proxy_ip" "$GCP_EXPECTED_IP" >&2
+    exit 1
+  fi
+  if [[ "$plain_ip" == "$GCP_EXPECTED_IP" ]]; then
+    printf 'ERROR: remote plain traffic is using GCP. This violates isolation.\n' >&2
+    exit 1
+  fi
+}
+
+diagnose() {
+  section "Local listeners"
+  lsof -nP -iTCP:"$LOCAL_SOCKS_PORT" -sTCP:LISTEN || true
+  lsof -nP -iTCP:"$LOCAL_HTTP_PORT" -sTCP:LISTEN || true
+  lsof -nP -iTCP:18080 -sTCP:LISTEN || true
+  lsof -nP -iTCP:18081 -sTCP:LISTEN || true
+
+  section "Local egress"
+  printf 'direct:      %s\n' "$(curl_ip_direct)"
+  printf 'via 1080:    %s\n' "$(curl_ip_local_socks)"
+  printf 'via 7890:    %s\n' "$(curl_ip_local_http)"
+
+  section "GCP SSH"
+  ssh -i "$GCP_KEY" -o IdentitiesOnly=yes -p "$GCP_PORT" -o ConnectTimeout=10 "${GCP_USER}@${GCP_HOST}" 'echo GCP_443_OK; hostname' || true
+
+  section "Remote traffic split"
+  ssh_remote "ss -ltn 2>/dev/null | egrep ':${REMOTE_HTTP_PORT}|:18080|:18081' || true"
+  printf 'remote via 10800: %s\n' "$(ssh_remote "curl -sS --connect-timeout 3 --max-time '$IP_CHECK_TIMEOUT' -x '$REMOTE_HTTP_URL' '$IP_CHECK_URL'" 2>/dev/null || true)"
+  printf 'remote plain:     %s\n' "$(ssh_remote "curl -sS --connect-timeout 3 --max-time '$IP_CHECK_TIMEOUT' '$IP_CHECK_URL'" 2>/dev/null || true)"
+
+  section "Remote Codex path and wrappers"
+  ssh_remote "which -a codex 2>/dev/null || true; readlink -f '$REMOTE_HOME/.local/bin/codex' 2>/dev/null || true; codex --version 2>&1 || true; printf '\n-- outer --\n'; head -40 '$REMOTE_HOME/.local/bin/codex-gcp' 2>/dev/null || true; printf '\n-- inner --\n'; head -40 '$REMOTE_HOME/.local/node/bin/codex' 2>/dev/null || true"
+
+  section "Remote config drift"
+  ssh_remote "printf -- '-- proxy.env --\n'; cat '$REMOTE_HOME/.codex/proxy.env' 2>/dev/null || true; printf -- '\n-- config.toml --\n'; cat '$REMOTE_HOME/.codex/config.toml' 2>/dev/null || true"
+
+  section "Remote stale process scan"
+  ssh_remote "ps -eo pid=,ppid=,args= | grep -E 'codex app-server proxy|app-server --listen unix://|modelhub|install-codex|18080|18081' | grep -v grep || true"
+  ssh_remote "for pid in \$(ps -eo pid=,args= | grep -E 'codex app-server proxy|app-server --listen unix://' | grep -v grep | sed 's/^ *//; s/ .*//' | head -8); do echo ==\$pid==; tr '\\0' '\\n' < /proc/\$pid/environ 2>/dev/null | grep -E '^(CODEX_HOME|HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|NO_PROXY)=' || true; done" || true
+
+  section "Logs"
+  tail -80 "$STATE_DIR/gcp-socks.manual.log" "$STATE_DIR/remote-forward.manual.log" "$STATE_DIR/privoxy-runtime.log" 2>/dev/null || true
+}
+
+repair() {
+  stop_local_launchd_if_present
+  start_local_socks
+  start_local_http
+  ensure_remote_wrappers
+  kill_stale_remote_processes
+  start_remote_forward
+  section "Repair complete"
+  printf 'Run final validation with: %s verify\n' "$(basename "$0")"
+}
+
+repair_fast() {
+  start_local_socks
+  start_local_http
+  SKIP_REMOTE_PLAIN_CHECK=1
+  start_remote_forward
+  section "Fast repair complete"
+  printf 'Run fast validation with: %s verify-fast\n' "$(basename "$0")"
+}
+
+verify_fast() {
+  section "Fast remote GCP validation"
+  local out rc
+  rc=0
+  out="$(ssh_remote "set -e
+printf '== remote 10800 proxy IP ==\n'
+proxy_ip=''
+for _ in \$(seq 1 '$VERIFY_FAST_ATTEMPTS'); do
+  proxy_ip=\"\$(curl -sS --connect-timeout 3 --max-time '$IP_CHECK_TIMEOUT' -x '$REMOTE_HTTP_URL' '$IP_CHECK_URL' 2>/dev/null || true)\"
+  [ \"\$proxy_ip\" = '$GCP_EXPECTED_IP' ] && break
+  sleep '$VERIFY_FAST_DELAY'
+done
+printf '%s\n' \"\$proxy_ip\"
+[ \"\$proxy_ip\" = '$GCP_EXPECTED_IP' ]
+printf '\n== chatgpt codex endpoint via 10800 ==\n'
+code=''
+for _ in \$(seq 1 '$VERIFY_FAST_ATTEMPTS'); do
+  code=\"\$(curl -sS -o /dev/null -w '%{http_code}' --connect-timeout 3 --max-time '$IP_CHECK_TIMEOUT' -x '$REMOTE_HTTP_URL' '$CHATGPT_CODEX_URL' 2>/dev/null || true)\"
+  case \"\$code\" in
+    2*|3*|4*) break ;;
+  esac
+  sleep '$VERIFY_FAST_DELAY'
+done
+printf '%s\n' \"\$code\"
+case \"\$code\" in
+  2*|3*|4*) exit 0 ;;
+  *) exit 1 ;;
+esac
+" 2>&1)" || rc=$?
+  printf '%s\n' "$out"
+  if [[ "$rc" -ne 0 ]]; then
+    printf 'ERROR: fast remote GCP validation failed with %s\n' "$rc" >&2
+    exit "$rc"
+  fi
+}
+
+verify() {
+  section "Direct SSH remote Codex validation"
+  local out rc
+  rc=0
+  out="$(ssh_remote "set -e
+printf '== direct remote codex path ==\n'
+which codex
+readlink -f '$REMOTE_HOME/.local/bin/codex'
+printf '== direct remote codex version ==\n'
+codex --version
+printf '== remote 10800 proxy IP ==\n'
+proxy_ip=''
+for _ in 1 2 3 4 5; do
+  proxy_ip=\"\$(curl -sS --connect-timeout 3 --max-time '$IP_CHECK_TIMEOUT' -x '$REMOTE_HTTP_URL' '$IP_CHECK_URL' 2>/dev/null || true)\"
+  [ \"\$proxy_ip\" = '$GCP_EXPECTED_IP' ] && break
+  sleep 2
+done
+printf '%s\n' \"\$proxy_ip\"
+[ \"\$proxy_ip\" = '$GCP_EXPECTED_IP' ]
+printf '\n== remote plain IP ==\n'
+curl -sS --connect-timeout 3 --max-time '$IP_CHECK_TIMEOUT' '$IP_CHECK_URL' || true
+printf '\n== chatgpt codex endpoint via 10800 ==\n'
+code=''
+for _ in \$(seq 1 '$VERIFY_FAST_ATTEMPTS'); do
+  code=\"\$(curl -sS -o /dev/null -w '%{http_code}' --connect-timeout 3 --max-time '$IP_CHECK_TIMEOUT' -x '$REMOTE_HTTP_URL' '$CHATGPT_CODEX_URL' 2>/dev/null || true)\"
+  case \"\$code\" in
+    2*|3*|4*) break ;;
+  esac
+  sleep '$VERIFY_FAST_DELAY'
+done
+printf '%s\n' \"\$code\"
+case \"\$code\" in
+  2*|3*|4*) exit 0 ;;
+  *) exit 1 ;;
+esac
+" 2>&1)" || rc=$?
+  printf '%s\n' "$out"
+  if [[ "$rc" -ne 0 ]]; then
+    printf 'ERROR: final Codex endpoint validation exited with %s\n' "$rc" >&2
+    exit "$rc"
+  fi
+}
+
+cmd="${1:-}"
+case "$cmd" in
+  diagnose|status)
+    diagnose
+    ;;
+  repair)
+    repair
+    ;;
+  repair-fast)
+    repair_fast
+    ;;
+  verify)
+    verify
+    ;;
+  verify-fast)
+    verify_fast
+    ;;
+  -h|--help|help|"")
+    usage
+    ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac
