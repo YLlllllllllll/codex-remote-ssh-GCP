@@ -19,6 +19,14 @@ The menu-bar app reads `/tmp/kinit-refresh.status` and exposes:
 - `刷新 SSH`: refresh/verify Kerberos and company SSH only.
 - `保持唤醒` / `关闭防休眠`: toggles the LaunchAgent-backed stay-awake helper.
 
+The `修复 GCP` menu title also shows read-only GCP traffic counters from the passive monitor:
+
+```text
+修复 GCP    流量 今日 12.3 MiB / 24h 18.7 MiB
+```
+
+The displayed total is RX+TX on the GCP VM interface. It is meant as an anomaly indicator: normal text-only Codex usage should stay far below GiB/day; multi-GiB/day means stale sessions or reconnect loops are likely.
+
 ## Install
 
 1. Copy `config.env.example` to `~/.config/codex-gcp-refresh/config.env`.
@@ -59,6 +67,7 @@ It records:
 
 - local listeners on `1080` and `7890`
 - route/interface used for the GCP VM
+- GCP VM interface RX/TX counters, today total, 24h total, and recent rate
 - local `7890` egress IP
 - remote `10800` listener and egress IP
 - ChatGPT endpoint HTTP code through remote `10800`

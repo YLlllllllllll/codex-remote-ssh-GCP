@@ -13,8 +13,13 @@ if [[ -f "$CONFIG_FILE" ]]; then
 fi
 
 GCP_HOST="${GCP_HOST:-203.0.113.10}"
+GCP_USER="${GCP_USER:-gcp-user}"
 GCP_PORT="${GCP_PORT:-443}"
+GCP_KEY="${GCP_KEY:-$LOCAL_HOME/.ssh/google_compute_engine}"
 GCP_EXPECTED_IP="${GCP_EXPECTED_IP:-203.0.113.10}"
+GCP_TRAFFIC_IFACE="${GCP_TRAFFIC_IFACE:-ens4}"
+TRAFFIC_24H_WARN_BYTES="${TRAFFIC_24H_WARN_BYTES:-1073741824}"
+TRAFFIC_24H_CRITICAL_BYTES="${TRAFFIC_24H_CRITICAL_BYTES:-3221225472}"
 REMOTE_HOST="${REMOTE_HOST:-${SSH_PROBE_TARGET:-remote-workspace}}"
 
 LOCAL_HTTP_HOST="${LOCAL_HTTP_HOST:-127.0.0.1}"
@@ -50,7 +55,7 @@ route_field() {
 
 listener_pids() {
   local port="$1"
-  lsof -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null | paste -sd, -
+  { lsof -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null || true; } | paste -sd, -
 }
 
 listener_count() {
@@ -71,6 +76,163 @@ curl_local_http_ip() {
 
 tcp_check() {
   nc -vz -G "$MONITOR_CONNECT_TIMEOUT" "$GCP_HOST" "$GCP_PORT" >/dev/null 2>&1 && printf ok || printf fail
+}
+
+gcp_counter_probe() {
+  ssh \
+    -i "$GCP_KEY" \
+    -o IdentitiesOnly=yes \
+    -p "$GCP_PORT" \
+    -o BatchMode=yes \
+    -o ConnectTimeout="$MONITOR_CONNECT_TIMEOUT" \
+    -o ConnectionAttempts=1 \
+    "${GCP_USER}@${GCP_HOST}" \
+    "awk -v iface='${GCP_TRAFFIC_IFACE}:' '\$1 == iface { print \$2, \$10; found=1 } END { exit found ? 0 : 1 }' /proc/net/dev" \
+    2>/dev/null || true
+}
+
+json_number_field() {
+  local key="$1"
+  awk -v key="$key" '
+    function value(line, key, start, rest, out) {
+      start = index(line, "\"" key "\":")
+      if (!start) {
+        return ""
+      }
+      rest = substr(line, start + length(key) + 3)
+      out = rest
+      sub(/[,}].*/, "", out)
+      gsub(/^"|"$/, "", out)
+      return out
+    }
+    {
+      print value($0, key)
+    }
+  '
+}
+
+traffic_delta_since() {
+  local since_epoch="$1"
+  local rx_now="$2"
+  local tx_now="$3"
+
+  if [[ ! "$rx_now" =~ ^[0-9]+$ || ! "$tx_now" =~ ^[0-9]+$ || ! -f "$LOG_FILE" ]]; then
+    printf '0\n'
+    return
+  fi
+
+  awk -v since="$since_epoch" -v rx_now="$rx_now" -v tx_now="$tx_now" '
+    function value(line, key, start, rest, out) {
+      start = index(line, "\"" key "\":")
+      if (!start) {
+        return ""
+      }
+      rest = substr(line, start + length(key) + 3)
+      out = rest
+      sub(/[,}].*/, "", out)
+      gsub(/^"|"$/, "", out)
+      return out
+    }
+    {
+      epoch = value($0, "epoch") + 0
+      rx = value($0, "gcp_rx_bytes")
+      tx = value($0, "gcp_tx_bytes")
+      if (epoch >= since && rx ~ /^[0-9]+$/ && tx ~ /^[0-9]+$/) {
+        if (first_epoch == 0 || epoch < first_epoch) {
+          first_epoch = epoch
+          first_rx = rx + 0
+          first_tx = tx + 0
+        }
+      }
+    }
+    END {
+      if (first_epoch == 0) {
+        print 0
+        exit
+      }
+      delta = (rx_now - first_rx) + (tx_now - first_tx)
+      if (delta < 0) {
+        delta = 0
+      }
+      print delta
+    }
+  ' "$LOG_FILE"
+}
+
+traffic_rate_bps() {
+  local epoch_now="$1"
+  local rx_now="$2"
+  local tx_now="$3"
+
+  if [[ ! "$rx_now" =~ ^[0-9]+$ || ! "$tx_now" =~ ^[0-9]+$ || ! -f "$LOG_FILE" ]]; then
+    printf '0\n'
+    return
+  fi
+
+  awk -v epoch_now="$epoch_now" -v rx_now="$rx_now" -v tx_now="$tx_now" '
+    function value(line, key, start, rest, out) {
+      start = index(line, "\"" key "\":")
+      if (!start) {
+        return ""
+      }
+      rest = substr(line, start + length(key) + 3)
+      out = rest
+      sub(/[,}].*/, "", out)
+      gsub(/^"|"$/, "", out)
+      return out
+    }
+    {
+      epoch = value($0, "epoch") + 0
+      rx = value($0, "gcp_rx_bytes")
+      tx = value($0, "gcp_tx_bytes")
+      if (epoch > 0 && epoch < epoch_now && rx ~ /^[0-9]+$/ && tx ~ /^[0-9]+$/) {
+        last_epoch = epoch
+        last_rx = rx + 0
+        last_tx = tx + 0
+      }
+    }
+    END {
+      if (last_epoch == 0 || epoch_now <= last_epoch) {
+        print 0
+        exit
+      }
+      delta = (rx_now - last_rx) + (tx_now - last_tx)
+      if (delta < 0) {
+        delta = 0
+      }
+      print int(delta / (epoch_now - last_epoch))
+    }
+  ' "$LOG_FILE"
+}
+
+human_bytes() {
+  awk -v bytes="${1:-0}" 'BEGIN {
+    split("B KiB MiB GiB TiB", unit, " ")
+    value = bytes + 0
+    idx = 1
+    while (value >= 1024 && idx < 5) {
+      value = value / 1024
+      idx++
+    }
+    if (idx == 1) {
+      printf "%d %s", value, unit[idx]
+    } else {
+      printf "%.1f %s", value, unit[idx]
+    }
+  }'
+}
+
+traffic_status_for() {
+  local bytes_24h="${1:-0}"
+  if [[ ! "$bytes_24h" =~ ^[0-9]+$ ]]; then
+    printf 'unknown\n'
+  elif [[ "$bytes_24h" -ge "$TRAFFIC_24H_CRITICAL_BYTES" ]]; then
+    printf 'critical\n'
+  elif [[ "$bytes_24h" -ge "$TRAFFIC_24H_WARN_BYTES" ]]; then
+    printf 'warning\n'
+  else
+    printf 'ok\n'
+  fi
 }
 
 remote_probe() {
@@ -115,9 +277,13 @@ sample() {
   local socks_count http_count socks_pids http_pids local_http_ip gcp_tcp
   local remote_rc remote_output remote_error remote_err_file remote_listen remote_proxy_ip chatgpt_code remote_app_count remote_notty_count
   local status cause status_file_status status_file_message
+  local gcp_counter_output gcp_rx_bytes gcp_tx_bytes traffic_today_bytes traffic_24h_bytes traffic_rate_bytes_per_sec traffic_status
+  local traffic_today_human traffic_24h_human traffic_rate_human today_start_epoch yesterday_epoch
 
   epoch="$(date +%s)"
   ts="$(date '+%Y-%m-%dT%H:%M:%S%z')"
+  today_start_epoch="$(date -j -v0H -v0M -v0S '+%s' 2>/dev/null || date '+%s')"
+  yesterday_epoch="$((epoch - 86400))"
   default_iface="$(route_field default interface || true)"
   default_gateway="$(route_field default gateway || true)"
   gcp_iface="$(route_field "$GCP_HOST" interface || true)"
@@ -128,6 +294,20 @@ sample() {
   http_pids="$(listener_pids "$LOCAL_HTTP_PORT")"
   local_http_ip="$(curl_local_http_ip)"
   gcp_tcp="$(tcp_check)"
+  gcp_counter_output="$(gcp_counter_probe)"
+  gcp_rx_bytes="$(awk '{print $1; exit}' <<<"$gcp_counter_output")"
+  gcp_tx_bytes="$(awk '{print $2; exit}' <<<"$gcp_counter_output")"
+  if [[ ! "$gcp_rx_bytes" =~ ^[0-9]+$ || ! "$gcp_tx_bytes" =~ ^[0-9]+$ ]]; then
+    gcp_rx_bytes=""
+    gcp_tx_bytes=""
+  fi
+  traffic_today_bytes="$(traffic_delta_since "$today_start_epoch" "${gcp_rx_bytes:-}" "${gcp_tx_bytes:-}")"
+  traffic_24h_bytes="$(traffic_delta_since "$yesterday_epoch" "${gcp_rx_bytes:-}" "${gcp_tx_bytes:-}")"
+  traffic_rate_bytes_per_sec="$(traffic_rate_bps "$epoch" "${gcp_rx_bytes:-}" "${gcp_tx_bytes:-}")"
+  traffic_today_human="$(human_bytes "$traffic_today_bytes")"
+  traffic_24h_human="$(human_bytes "$traffic_24h_bytes")"
+  traffic_rate_human="$(human_bytes "$traffic_rate_bytes_per_sec")/s"
+  traffic_status="$(traffic_status_for "$traffic_24h_bytes")"
   status_file_status="$(awk -F= '$1=="STATUS" {print $2; exit}' /tmp/kinit-refresh.status 2>/dev/null || true)"
   status_file_message="$(awk -F= '$1=="MESSAGE" {print $2; exit}' /tmp/kinit-refresh.status 2>/dev/null || true)"
 
@@ -181,6 +361,16 @@ GCP_IFACE=$gcp_iface
 GCP_GATEWAY=$gcp_gateway
 KINIT_STATUS=$status_file_status
 KINIT_MESSAGE=$status_file_message
+GCP_COUNTER_IFACE=$GCP_TRAFFIC_IFACE
+GCP_RX_BYTES=$gcp_rx_bytes
+GCP_TX_BYTES=$gcp_tx_bytes
+TRAFFIC_TODAY_BYTES=$traffic_today_bytes
+TRAFFIC_TODAY_HUMAN=$traffic_today_human
+TRAFFIC_24H_BYTES=$traffic_24h_bytes
+TRAFFIC_24H_HUMAN=$traffic_24h_human
+TRAFFIC_RATE_BYTES_PER_SEC=$traffic_rate_bytes_per_sec
+TRAFFIC_RATE_HUMAN=$traffic_rate_human
+TRAFFIC_STATUS=$traffic_status
 EOF
 
   printf '{'
@@ -193,6 +383,13 @@ EOF
   printf '"default_gateway":"%s",' "$(json_value "$default_gateway")"
   printf '"gcp_iface":"%s",' "$(json_value "$gcp_iface")"
   printf '"gcp_gateway":"%s",' "$(json_value "$gcp_gateway")"
+  printf '"gcp_counter_iface":"%s",' "$(json_value "$GCP_TRAFFIC_IFACE")"
+  printf '"gcp_rx_bytes":%s,' "${gcp_rx_bytes:-0}"
+  printf '"gcp_tx_bytes":%s,' "${gcp_tx_bytes:-0}"
+  printf '"traffic_today_bytes":%s,' "${traffic_today_bytes:-0}"
+  printf '"traffic_24h_bytes":%s,' "${traffic_24h_bytes:-0}"
+  printf '"traffic_rate_bytes_per_sec":%s,' "${traffic_rate_bytes_per_sec:-0}"
+  printf '"traffic_status":"%s",' "$(json_value "$traffic_status")"
   printf '"local_1080_count":%s,' "${socks_count:-0}"
   printf '"local_1080_pids":"%s",' "$(json_value "$socks_pids")"
   printf '"local_7890_count":%s,' "${http_count:-0}"

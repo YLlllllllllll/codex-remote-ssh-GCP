@@ -7,7 +7,7 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>@/bin/kinit-refresh-status</string>
+        <string>@HOME@/bin/kinit-refresh-status</string>
     </array>
 
     <key>RunAtLoad</key>

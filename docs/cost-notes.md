@@ -41,6 +41,8 @@ Default guardrails:
 - `CODEX_EXEC_CLEAN_MARKER`: optional marker used by live CI to clean only test workers.
 - `GCP_TRAFFIC_SAMPLE_SECONDS=20`: traffic verification sample window.
 - `GCP_TRAFFIC_LIMIT_BYTES=10485760`: total RX+TX bytes allowed during the sample before the command exits non-zero.
+- `TRAFFIC_24H_WARN_BYTES=1073741824`: menu traffic status turns warning at 1 GiB/24h.
+- `TRAFFIC_24H_CRITICAL_BYTES=3221225472`: menu traffic status turns critical at 3 GiB/24h.
 
 Regression checks:
 

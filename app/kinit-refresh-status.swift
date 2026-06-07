@@ -5,6 +5,7 @@ final class StatusApp: NSObject, NSApplicationDelegate {
     private let home = NSHomeDirectory()
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let statusPath = "/tmp/kinit-refresh.status"
+    private lazy var trafficPath = "\(home)/.codex-gcp-tunnel/monitor-latest.env"
     private lazy var refreshScript = "\(home)/bin/kinit-refresh"
     private lazy var stayAwakeScript = "\(home)/bin/stay-awake.sh"
     private lazy var stayAwakePlist = "\(home)/Library/LaunchAgents/com.example.stay-awake.plist"
@@ -13,6 +14,7 @@ final class StatusApp: NSObject, NSApplicationDelegate {
     private let staleSeconds: TimeInterval = 20 * 60
     private var timer: Timer?
     private let summaryItem = NSMenuItem(title: "刷新状态中...", action: nil, keyEquivalent: "")
+    private let refreshGCPItem = NSMenuItem(title: "修复 GCP", action: #selector(refreshRemoteGCP), keyEquivalent: "g")
     private let toggleStayAwakeItem = NSMenuItem(title: "保持唤醒", action: #selector(toggleStayAwake), keyEquivalent: "a")
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -28,7 +30,7 @@ final class StatusApp: NSObject, NSApplicationDelegate {
         let menu = NSMenu()
         menu.addItem(summaryItem)
         menu.addItem(NSMenuItem.separator())
-        menu.addItem(NSMenuItem(title: "修复 GCP", action: #selector(refreshRemoteGCP), keyEquivalent: "g"))
+        menu.addItem(refreshGCPItem)
         menu.addItem(NSMenuItem(title: "刷新 SSH", action: #selector(refreshSSH), keyEquivalent: "r"))
         menu.addItem(toggleStayAwakeItem)
         statusItem.menu = menu
@@ -38,6 +40,7 @@ final class StatusApp: NSObject, NSApplicationDelegate {
 
     private func updateStatus() {
         let data = readStatus()
+        let traffic = readTraffic()
         let status = data["STATUS"] ?? "unknown"
         let ssh = data["SSH"] ?? "unknown"
         let proxy = data["PROXY"] ?? "unknown"
@@ -65,21 +68,35 @@ final class StatusApp: NSObject, NSApplicationDelegate {
 
         let shortExp = shorten(exp)
         let title = icon + "KC"
+        let trafficLabel = trafficSummary(traffic)
         statusItem.button?.title = title
-        statusItem.button?.toolTip = "kinit-refresh: \(message) | SSH: \(ssh) | Proxy: \(proxy) | Codex: \(codex) | Exp: \(shortExp)"
+        statusItem.button?.toolTip = "kinit-refresh: \(message) | SSH: \(ssh) | Proxy: \(proxy) | Codex: \(codex) | Exp: \(shortExp) | \(trafficLabel)"
 
         summaryItem.title = "\(title) | SSH: \(ssh) | \(message)"
-        summaryItem.toolTip = "Proxy: \(proxy) | Codex: \(codex) | 更新: \(updated)"
+        summaryItem.toolTip = "Proxy: \(proxy) | Codex: \(codex) | 更新: \(updated) | \(trafficLabel)"
+        refreshGCPItem.title = "修复 GCP    \(trafficLabel)"
+        refreshGCPItem.toolTip = trafficTooltip(traffic)
 
         let awakeRunning = isStayAwakeRunning()
         toggleStayAwakeItem.title = awakeRunning ? "关闭防休眠" : "保持唤醒"
     }
 
     private func readStatus() -> [String: String] {
-        guard let content = try? String(contentsOfFile: statusPath, encoding: .utf8) else {
+        let result = readKeyValueFile(statusPath)
+        if result.isEmpty {
             return ["STATUS": "fail", "SSH": "unknown", "MESSAGE": "状态文件不存在, 等待下一次刷新"]
         }
+        return result
+    }
 
+    private func readTraffic() -> [String: String] {
+        return readKeyValueFile(trafficPath)
+    }
+
+    private func readKeyValueFile(_ path: String) -> [String: String] {
+        guard let content = try? String(contentsOfFile: path, encoding: .utf8) else {
+            return [:]
+        }
         var result: [String: String] = [:]
         for line in content.split(separator: "\n", omittingEmptySubsequences: false) {
             guard let idx = line.firstIndex(of: "=") else { continue }
@@ -88,6 +105,33 @@ final class StatusApp: NSObject, NSApplicationDelegate {
             result[key] = value
         }
         return result
+    }
+
+    private func trafficSummary(_ traffic: [String: String]) -> String {
+        let today = traffic["TRAFFIC_TODAY_HUMAN"] ?? "采样中"
+        let day = traffic["TRAFFIC_24H_HUMAN"] ?? "采样中"
+        let status = traffic["TRAFFIC_STATUS"] ?? "unknown"
+
+        let prefix: String
+        switch status {
+        case "critical":
+            prefix = "流量异常"
+        case "warning":
+            prefix = "流量偏高"
+        default:
+            prefix = "流量"
+        }
+
+        return "\(prefix) 今日 \(today) / 24h \(day)"
+    }
+
+    private func trafficTooltip(_ traffic: [String: String]) -> String {
+        let updated = traffic["UPDATED"] ?? "unknown"
+        let rate = traffic["TRAFFIC_RATE_HUMAN"] ?? "unknown"
+        let iface = traffic["GCP_COUNTER_IFACE"] ?? "unknown"
+        let rx = traffic["GCP_RX_BYTES"] ?? "unknown"
+        let tx = traffic["GCP_TX_BYTES"] ?? "unknown"
+        return "\(trafficSummary(traffic)) | 当前速率 \(rate) | iface \(iface) | RX \(rx) | TX \(tx) | 更新 \(updated)"
     }
 
     private func shorten(_ exp: String) -> String {

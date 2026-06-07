@@ -28,10 +28,14 @@ bash -n bin/kinit-refresh bin/codex-gcp-remote bin/codex-gcp-monitor bin/stay-aw
 swiftc -parse app/kinit-refresh-status.swift
 plutil -lint launchd/com.example.kinit-refresh.plist launchd/com.example.kinit-refresh-status.plist launchd/com.example.stay-awake.plist launchd/com.example.codex-gcp-monitor.plist >/dev/null
 python3 -m py_compile tools/codex-http-to-socks.py
+reject_pattern '<string>@/bin/' launchd/com.example.kinit-refresh-status.plist
 
 printf '== app menu contract ==\n'
 need_pattern 'title: "修复 GCP".*refreshRemoteGCP' app/kinit-refresh-status.swift
 need_pattern 'title: "刷新 SSH".*refreshSSH' app/kinit-refresh-status.swift
+need_pattern 'trafficSummary' app/kinit-refresh-status.swift
+need_pattern 'TRAFFIC_TODAY_HUMAN' app/kinit-refresh-status.swift
+need_pattern 'TRAFFIC_24H_HUMAN' app/kinit-refresh-status.swift
 need_pattern 'toggleStayAwake' app/kinit-refresh-status.swift
 reject_pattern '强制清理 Remote GCP|完整验证 Remote GCP|打开日志|退出状态栏' app/kinit-refresh-status.swift
 
@@ -66,6 +70,10 @@ printf '== passive monitor contract ==\n'
 need_pattern 'codex-gcp-monitor \[sample\|status\|tail \[n\]\|path\]' bin/codex-gcp-monitor
 need_pattern 'monitor.jsonl' bin/codex-gcp-monitor
 need_pattern 'monitor-latest.env' bin/codex-gcp-monitor
+need_pattern 'GCP_RX_BYTES' bin/codex-gcp-monitor
+need_pattern 'TRAFFIC_TODAY_BYTES' bin/codex-gcp-monitor
+need_pattern 'TRAFFIC_24H_BYTES' bin/codex-gcp-monitor
+need_pattern 'TRAFFIC_STATUS' bin/codex-gcp-monitor
 need_pattern 'StartInterval' launchd/com.example.codex-gcp-monitor.plist
 reject_pattern 'kinit-refresh remote-gcp|clean-repair-fast|killall|pkill|launchctl setenv|/Applications/Codex.app' bin/codex-gcp-monitor
 
