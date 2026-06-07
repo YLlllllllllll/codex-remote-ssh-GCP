@@ -24,7 +24,7 @@ reject_pattern() {
 }
 
 printf '== static syntax ==\n'
-bash -n bin/kinit-refresh bin/codex-gcp-remote bin/codex-gcp-monitor bin/stay-awake.sh scripts/install.sh scripts/fake-repair-ci.sh
+bash -n bin/kinit-refresh bin/codex-gcp-remote bin/codex-gcp-monitor bin/stay-awake.sh scripts/install.sh scripts/fake-repair-ci.sh scripts/live-egress-ci.sh
 swiftc -parse app/kinit-refresh-status.swift
 plutil -lint launchd/com.example.kinit-refresh.plist launchd/com.example.kinit-refresh-status.plist launchd/com.example.stay-awake.plist launchd/com.example.codex-gcp-monitor.plist >/dev/null
 python3 -m py_compile tools/codex-http-to-socks.py
@@ -49,8 +49,18 @@ need_pattern 'force_reset_local_proxy' bin/codex-gcp-remote
 need_pattern 'force_reset_remote_proxy' bin/codex-gcp-remote
 need_pattern 'clean_stale_remote_codex_exec' bin/codex-gcp-remote
 need_pattern 'STALE_CODEX_EXEC_MIN_AGE' bin/codex-gcp-remote
+need_pattern 'CODEX_EXEC_CLEAN_MARKER' bin/codex-gcp-remote
 need_pattern 'restart_remote_codex_app_server' bin/codex-gcp-remote
 need_pattern 'start_remote_forward' bin/codex-gcp-remote
+
+printf '== live CI contract ==\n'
+need_pattern 'scripts/fake-repair-ci.sh' scripts/live-egress-ci.sh
+need_pattern 'KINIT_SCRIPT.*stop-gcp' scripts/live-egress-ci.sh
+need_pattern 'repair-fast' scripts/live-egress-ci.sh
+need_pattern 'verify-fast' scripts/live-egress-ci.sh
+need_pattern 'CODEX_EXEC_CLEAN_MARKER=.*CI_MARKER' scripts/live-egress-ci.sh
+need_pattern 'STALE_CODEX_EXEC_MIN_AGE=1' scripts/live-egress-ci.sh
+reject_pattern '/home/tiger/.local.*/codex exec|/Applications/Codex.app|launchctl setenv|open -a Codex' scripts/live-egress-ci.sh
 
 printf '== passive monitor contract ==\n'
 need_pattern 'codex-gcp-monitor \[sample\|status\|tail \[n\]\|path\]' bin/codex-gcp-monitor

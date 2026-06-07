@@ -38,5 +38,13 @@ codex-gcp-remote limit-egress      # stop, clean, then verify traffic drop
 Default guardrails:
 
 - `STALE_CODEX_EXEC_MIN_AGE=1800`: only stale remote `codex exec` workers older than 30 minutes are cleaned.
+- `CODEX_EXEC_CLEAN_MARKER`: optional marker used by live CI to clean only test workers.
 - `GCP_TRAFFIC_SAMPLE_SECONDS=20`: traffic verification sample window.
 - `GCP_TRAFFIC_LIMIT_BYTES=10485760`: total RX+TX bytes allowed during the sample before the command exits non-zero.
+
+Regression checks:
+
+```bash
+scripts/fake-repair-ci.sh  # no side effects
+scripts/live-egress-ci.sh  # opens GCP briefly, verifies, then stops it
+```

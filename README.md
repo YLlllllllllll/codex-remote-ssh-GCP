@@ -88,6 +88,14 @@ Use this when editing the scripts. It does not kill processes, change routes, bi
 scripts/fake-repair-ci.sh
 ```
 
+For an explicit live smoke test, use:
+
+```bash
+scripts/live-egress-ci.sh
+```
+
+This one is intentionally named as live CI because it briefly opens the GCP egress path, verifies remote `10800` and ChatGPT endpoint reachability, creates marker-scoped fake stale workers, then runs `kinit-refresh stop-gcp` and verifies the tunnel is closed with low GCP traffic. Do not run it while real long-running `codex exec` jobs are expected to remain active.
+
 ## Cost Controls
 
 The GCP VM is an egress proxy. Cost is usually dominated by network traffic, not CPU. Stop the tunnel when it is not needed:

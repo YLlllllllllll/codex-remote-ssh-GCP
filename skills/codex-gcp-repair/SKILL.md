@@ -64,6 +64,16 @@ scripts/fake-repair-ci.sh
 
 Do not run the live one-shot repair merely to test code changes. Run the live repair only when the user explicitly wants the actual tunnel fixed or when the user has accepted the disruption.
 
+## Live Egress CI
+
+Use this only when the user explicitly asks for a full live test. It briefly opens the GCP path, verifies that requested Codex traffic goes through remote `10800`, creates marker-scoped fake stale workers, then stops GCP egress and verifies low traffic:
+
+```bash
+scripts/live-egress-ci.sh
+```
+
+The live CI must end by running `kinit-refresh stop-gcp`. If it fails midway, inspect `/tmp/kinit-refresh.status`, local `1080/7890`, remote `codex exec`, and `codex-gcp-remote traffic-sample 20`.
+
 ## Required Validation
 
 Do not trust a stale green menu icon by itself. After a live repair, verify the data plane:
