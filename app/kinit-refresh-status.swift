@@ -6,6 +6,7 @@ final class StatusApp: NSObject, NSApplicationDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let statusPath = "/tmp/kinit-refresh.status"
     private lazy var trafficPath = "\(home)/.codex-gcp-tunnel/monitor-latest.env"
+    private lazy var sessionsPath = "\(home)/.codex-gcp-tunnel/active-sessions.txt"
     private lazy var refreshScript = "\(home)/bin/kinit-refresh"
     private lazy var stayAwakeScript = "\(home)/bin/stay-awake.sh"
     private lazy var stayAwakePlist = "\(home)/Library/LaunchAgents/com.example.stay-awake.plist"
@@ -15,6 +16,8 @@ final class StatusApp: NSObject, NSApplicationDelegate {
     private var timer: Timer?
     private let summaryItem = NSMenuItem(title: "刷新状态中...", action: nil, keyEquivalent: "")
     private let refreshGCPItem = NSMenuItem(title: "修复 GCP", action: #selector(refreshRemoteGCP), keyEquivalent: "g")
+    private let sessionsItem = NSMenuItem(title: "Codex Sessions: 采样中", action: nil, keyEquivalent: "")
+    private let sessionsMenu = NSMenu(title: "Codex Sessions")
     private let toggleStayAwakeItem = NSMenuItem(title: "保持唤醒", action: #selector(toggleStayAwake), keyEquivalent: "a")
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -31,6 +34,8 @@ final class StatusApp: NSObject, NSApplicationDelegate {
         menu.addItem(summaryItem)
         menu.addItem(NSMenuItem.separator())
         menu.addItem(refreshGCPItem)
+        sessionsItem.submenu = sessionsMenu
+        menu.addItem(sessionsItem)
         menu.addItem(NSMenuItem(title: "刷新 SSH", action: #selector(refreshSSH), keyEquivalent: "r"))
         menu.addItem(toggleStayAwakeItem)
         statusItem.menu = menu
@@ -41,6 +46,7 @@ final class StatusApp: NSObject, NSApplicationDelegate {
     private func updateStatus() {
         let data = readStatus()
         let traffic = readTraffic()
+        let sessions = readSessions()
         let status = data["STATUS"] ?? "unknown"
         let ssh = data["SSH"] ?? "unknown"
         let proxy = data["PROXY"] ?? "unknown"
@@ -76,6 +82,7 @@ final class StatusApp: NSObject, NSApplicationDelegate {
         summaryItem.toolTip = "Proxy: \(proxy) | Codex: \(codex) | 更新: \(updated) | \(trafficLabel)"
         refreshGCPItem.title = "修复 GCP    \(trafficLabel)"
         refreshGCPItem.toolTip = trafficTooltip(traffic)
+        updateSessionsMenu(traffic: traffic, sessions: sessions)
 
         let awakeRunning = isStayAwakeRunning()
         toggleStayAwakeItem.title = awakeRunning ? "关闭防休眠" : "保持唤醒"
@@ -91,6 +98,10 @@ final class StatusApp: NSObject, NSApplicationDelegate {
 
     private func readTraffic() -> [String: String] {
         return readKeyValueFile(trafficPath)
+    }
+
+    private func readSessions() -> String {
+        return (try? String(contentsOfFile: sessionsPath, encoding: .utf8)) ?? ""
     }
 
     private func readKeyValueFile(_ path: String) -> [String: String] {
@@ -135,6 +146,53 @@ final class StatusApp: NSObject, NSApplicationDelegate {
         return "\(trafficSummary(traffic)) | 当前速率 \(rate) | iface \(iface) | RX \(rx) | TX \(tx) | 更新 \(updated)"
     }
 
+    private func updateSessionsMenu(traffic: [String: String], sessions: String) {
+        let execCount = traffic["REMOTE_CODEX_EXEC_COUNT"] ?? "?"
+        let socketCount = traffic["REMOTE_10800_SOCKET_COUNT"] ?? "?"
+        let appServerCount = traffic["REMOTE_APP_SERVER_COUNT"] ?? "?"
+        let updated = traffic["UPDATED"] ?? "unknown"
+
+        sessionsItem.title = "Codex Sessions: \(execCount)    10800连接 \(socketCount)"
+        sessionsItem.toolTip = "远端 codex exec: \(execCount) | 10800 连接: \(socketCount) | app-server: \(appServerCount) | 更新: \(updated)"
+
+        sessionsMenu.removeAllItems()
+        sessionsMenu.addItem(NSMenuItem(title: "codex exec: \(execCount) | 10800连接: \(socketCount) | app-server: \(appServerCount)", action: nil, keyEquivalent: ""))
+        sessionsMenu.addItem(NSMenuItem(title: "更新: \(updated)", action: nil, keyEquivalent: ""))
+        sessionsMenu.addItem(NSMenuItem.separator())
+
+        let detailLines = sessions
+            .split(separator: "\n", omittingEmptySubsequences: true)
+            .map(String.init)
+            .filter { !$0.hasPrefix("UPDATED=") && !$0.hasPrefix("REMOTE_") && !$0.hasPrefix("REMOTE_HOST=") }
+
+        if detailLines.isEmpty {
+            sessionsMenu.addItem(NSMenuItem(title: "等待 monitor 采样", action: nil, keyEquivalent: ""))
+        } else {
+            for line in detailLines.prefix(12) {
+                sessionsMenu.addItem(NSMenuItem(title: abbreviate(line, maxLength: 96), action: nil, keyEquivalent: ""))
+            }
+            if detailLines.count > 12 {
+                sessionsMenu.addItem(NSMenuItem(title: "还有 \(detailLines.count - 12) 行，打开详情日志查看", action: nil, keyEquivalent: ""))
+            }
+        }
+
+        sessionsMenu.addItem(NSMenuItem.separator())
+        let openItem = NSMenuItem(title: "打开详情日志", action: #selector(openSessionsLog), keyEquivalent: "o")
+        openItem.target = self
+        sessionsMenu.addItem(openItem)
+        let copyItem = NSMenuItem(title: "复制详情", action: #selector(copySessionsLog), keyEquivalent: "c")
+        copyItem.target = self
+        sessionsMenu.addItem(copyItem)
+    }
+
+    private func abbreviate(_ value: String, maxLength: Int) -> String {
+        if value.count <= maxLength {
+            return value
+        }
+        let end = value.index(value.startIndex, offsetBy: maxLength - 1)
+        return String(value[..<end]) + "..."
+    }
+
     private func shorten(_ exp: String) -> String {
         let parts = exp.split(separator: " ").map(String.init)
         if parts.count >= 2 {
@@ -149,6 +207,17 @@ final class StatusApp: NSObject, NSApplicationDelegate {
 
     @objc private func refreshRemoteGCP() {
         runRefresh(title: "🟡KC", arguments: ["remote-gcp"])
+    }
+
+    @objc private func openSessionsLog() {
+        NSWorkspace.shared.open(URL(fileURLWithPath: sessionsPath))
+    }
+
+    @objc private func copySessionsLog() {
+        let content = readSessions()
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(content, forType: .string)
     }
 
     private func runRefresh(title: String, arguments: [String]) {

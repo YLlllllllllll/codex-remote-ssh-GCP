@@ -38,6 +38,12 @@ need_pattern 'TRAFFIC_TODAY_HUMAN' app/kinit-refresh-status.swift
 need_pattern 'TRAFFIC_24H_HUMAN' app/kinit-refresh-status.swift
 need_pattern 'TRAFFIC_RATE_HUMAN' app/kinit-refresh-status.swift
 need_pattern '当前' app/kinit-refresh-status.swift
+need_pattern 'sessionsItem' app/kinit-refresh-status.swift
+need_pattern 'Codex Sessions' app/kinit-refresh-status.swift
+need_pattern 'REMOTE_CODEX_EXEC_COUNT' app/kinit-refresh-status.swift
+need_pattern 'REMOTE_10800_SOCKET_COUNT' app/kinit-refresh-status.swift
+need_pattern 'openSessionsLog' app/kinit-refresh-status.swift
+need_pattern 'copySessionsLog' app/kinit-refresh-status.swift
 need_pattern 'toggleStayAwake' app/kinit-refresh-status.swift
 reject_pattern '强制清理 Remote GCP|完整验证 Remote GCP|打开日志|退出状态栏' app/kinit-refresh-status.swift
 
@@ -76,6 +82,9 @@ need_pattern 'GCP_RX_BYTES' bin/codex-gcp-monitor
 need_pattern 'TRAFFIC_TODAY_BYTES' bin/codex-gcp-monitor
 need_pattern 'TRAFFIC_24H_BYTES' bin/codex-gcp-monitor
 need_pattern 'TRAFFIC_STATUS' bin/codex-gcp-monitor
+need_pattern 'active-sessions.txt' bin/codex-gcp-monitor
+need_pattern 'REMOTE_CODEX_EXEC_COUNT' bin/codex-gcp-monitor
+need_pattern 'REMOTE_10800_SOCKET_COUNT' bin/codex-gcp-monitor
 need_pattern 'StartInterval' launchd/com.example.codex-gcp-monitor.plist
 reject_pattern 'kinit-refresh remote-gcp|clean-repair-fast|killall|pkill|launchctl setenv|/Applications/Codex.app' bin/codex-gcp-monitor
 

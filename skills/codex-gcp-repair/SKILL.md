@@ -135,3 +135,5 @@ The monitor is intended to collect evidence before random disconnects:
 It writes JSONL to `$REAL_HOME/.codex-gcp-tunnel/monitor.jsonl` and a latest summary to `$REAL_HOME/.codex-gcp-tunnel/monitor-latest.env`. It is read-only and must not be used as a repair mechanism.
 
 The status-bar app reads `monitor-latest.env` and shows GCP traffic next to `修复 GCP` as `今日 ... / 24h ...`. Treat warning or critical traffic as a cost investigation signal before running another repair.
+
+It also shows `Codex Sessions: N`. This is the remote `codex exec` worker count. Expand it to inspect `$REAL_HOME/.codex-gcp-tunnel/active-sessions.txt`, which includes PID, PPID, age, CPU, memory, and command summary for mismatch debugging.

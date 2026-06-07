@@ -21,6 +21,8 @@ The menu-bar app reads `/tmp/kinit-refresh.status` and exposes:
 
 `修复 GCP` automatically cleans stale remote sessions and processes before rebuilding the proxy path. It removes stale `codex exec` workers older than `STALE_CODEX_EXEC_MIN_AGE`, stale SSH tunnel sessions, and stale app-server/proxy state. It does not blindly kill every Codex process, so fresh real work is not treated as disposable.
 
+The menu also shows `Codex Sessions: N`. Expand that item to compare the monitor's remote `codex exec` workers against the work you expect to be running. The submenu lists PID, parent PID, age, CPU, memory, and command summary, with buttons to open or copy the latest detail log.
+
 The `修复 GCP` menu title also shows read-only GCP traffic counters from the passive monitor:
 
 ```text
@@ -70,6 +72,7 @@ It records:
 - local listeners on `1080` and `7890`
 - route/interface used for the GCP VM
 - GCP VM interface RX/TX counters, today total, 24h total, and recent rate
+- remote `codex exec` worker count and latest session detail log
 - local `7890` egress IP
 - remote `10800` listener and egress IP
 - ChatGPT endpoint HTTP code through remote `10800`
@@ -89,6 +92,7 @@ Logs are stored under `~/.codex-gcp-tunnel/`:
 ```text
 monitor.jsonl
 monitor-latest.env
+active-sessions.txt
 ```
 
 ## Non-Disruptive CI

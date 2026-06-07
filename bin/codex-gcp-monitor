@@ -36,6 +36,7 @@ MONITOR_MAX_BYTES="${MONITOR_MAX_BYTES:-10485760}"
 STATE_DIR="${STATE_DIR:-$LOCAL_HOME/.codex-gcp-tunnel}"
 LOG_FILE="${MONITOR_LOG_FILE:-$STATE_DIR/monitor.jsonl}"
 LATEST_FILE="${MONITOR_LATEST_FILE:-$STATE_DIR/monitor-latest.env}"
+SESSIONS_FILE="${MONITOR_SESSIONS_FILE:-$STATE_DIR/active-sessions.txt}"
 LOCAL_HTTP_URL="http://${LOCAL_HTTP_HOST}:${LOCAL_HTTP_PORT}"
 REMOTE_HTTP_URL="http://${REMOTE_HTTP_HOST}:${REMOTE_HTTP_PORT}"
 
@@ -246,15 +247,38 @@ remote_probe() {
     "REMOTE_HTTP_PORT='$REMOTE_HTTP_PORT' REMOTE_HTTP_URL='$REMOTE_HTTP_URL' IP_CHECK_URL='$IP_CHECK_URL' CHATGPT_CODEX_URL='$CHATGPT_CODEX_URL' MONITOR_CONNECT_TIMEOUT='$MONITOR_CONNECT_TIMEOUT' MONITOR_MAX_TIME='$MONITOR_MAX_TIME' bash -s" <<'REMOTE' || return $?
 set -u
 listen_count="$(ss -ltn 2>/dev/null | awk -v port="$REMOTE_HTTP_PORT" '$4 ~ ":" port "$" { count++ } END { print count + 0 }')"
+socket_count="$(ss -tnp 2>/dev/null | awk -v port="$REMOTE_HTTP_PORT" '$4 ~ ":" port "$" || $5 ~ ":" port "$" { count++ } END { print count + 0 }')"
 proxy_ip="$(curl -sS --connect-timeout "$MONITOR_CONNECT_TIMEOUT" --max-time "$MONITOR_MAX_TIME" -x "$REMOTE_HTTP_URL" "$IP_CHECK_URL" 2>/dev/null || true)"
 chatgpt_code="$(curl -sS -o /dev/null -w '%{http_code}' --connect-timeout "$MONITOR_CONNECT_TIMEOUT" --max-time "$MONITOR_MAX_TIME" -x "$REMOTE_HTTP_URL" "$CHATGPT_CODEX_URL" 2>/dev/null || true)"
 app_server_count="$(ps -eo args= 2>/dev/null | grep -E 'codex app-server proxy|app-server --listen unix://' | grep -v grep | wc -l | tr -d ' ')"
 notty_count="$(ps -eo args= 2>/dev/null | grep -E 'sshd: .*@notty' | grep -v grep | wc -l | tr -d ' ')"
+session_lines="$(ps -eo pid=,ppid=,etimes=,etime=,pcpu=,pmem=,args= 2>/dev/null | awk '
+  /\/bin\/codex exec/ && $0 !~ /awk / {
+    args = ""
+    for (i = 7; i <= NF; i++) {
+      args = args (i == 7 ? "" : " ") $i
+    }
+    if (length(args) > 180) {
+      args = substr(args, 1, 177) "..."
+    }
+    printf "pid=%s ppid=%s age=%ss etime=%s cpu=%s mem=%s cmd=%s\n", $1, $2, $3, $4, $5, $6, args
+  }
+')"
+codex_exec_count="$(printf '%s\n' "$session_lines" | awk 'NF { count++ } END { print count + 0 }')"
 printf 'REMOTE_LISTEN=%s\n' "$listen_count"
+printf 'REMOTE_10800_SOCKET_COUNT=%s\n' "$socket_count"
 printf 'REMOTE_PROXY_IP=%s\n' "$proxy_ip"
 printf 'CHATGPT_CODE=%s\n' "$chatgpt_code"
 printf 'REMOTE_APP_SERVER_COUNT=%s\n' "$app_server_count"
 printf 'REMOTE_NOTTY_COUNT=%s\n' "$notty_count"
+printf 'REMOTE_CODEX_EXEC_COUNT=%s\n' "$codex_exec_count"
+printf 'CODEX_SESSION_DETAIL_BEGIN\n'
+if [ -n "$session_lines" ]; then
+  printf '%s\n' "$session_lines"
+else
+  printf 'no codex exec workers\n'
+fi
+printf 'CODEX_SESSION_DETAIL_END\n'
 REMOTE
 }
 
@@ -276,6 +300,7 @@ sample() {
   local ts epoch default_iface default_gateway gcp_iface gcp_gateway
   local socks_count http_count socks_pids http_pids local_http_ip gcp_tcp
   local remote_rc remote_output remote_error remote_err_file remote_listen remote_proxy_ip chatgpt_code remote_app_count remote_notty_count
+  local remote_10800_socket_count remote_codex_exec_count remote_session_detail
   local status cause status_file_status status_file_message
   local gcp_counter_output gcp_rx_bytes gcp_tx_bytes traffic_today_bytes traffic_24h_bytes traffic_rate_bytes_per_sec traffic_status
   local traffic_today_human traffic_24h_human traffic_rate_human today_start_epoch yesterday_epoch
@@ -317,10 +342,30 @@ sample() {
   remote_error="$(tr '\n' ' ' < "$remote_err_file" 2>/dev/null | cut -c 1-500 || true)"
   rm -f "$remote_err_file" 2>/dev/null || true
   remote_listen="$(awk -F= '$1=="REMOTE_LISTEN" {print $2; exit}' <<<"$remote_output")"
+  remote_10800_socket_count="$(awk -F= '$1=="REMOTE_10800_SOCKET_COUNT" {print $2; exit}' <<<"$remote_output")"
   remote_proxy_ip="$(awk -F= '$1=="REMOTE_PROXY_IP" {print $2; exit}' <<<"$remote_output")"
   chatgpt_code="$(awk -F= '$1=="CHATGPT_CODE" {print $2; exit}' <<<"$remote_output")"
   remote_app_count="$(awk -F= '$1=="REMOTE_APP_SERVER_COUNT" {print $2; exit}' <<<"$remote_output")"
   remote_notty_count="$(awk -F= '$1=="REMOTE_NOTTY_COUNT" {print $2; exit}' <<<"$remote_output")"
+  remote_codex_exec_count="$(awk -F= '$1=="REMOTE_CODEX_EXEC_COUNT" {print $2; exit}' <<<"$remote_output")"
+  remote_session_detail="$(awk '
+    /^CODEX_SESSION_DETAIL_BEGIN$/ { capture=1; next }
+    /^CODEX_SESSION_DETAIL_END$/ { capture=0; next }
+    capture { print }
+  ' <<<"$remote_output")"
+  remote_10800_socket_count="${remote_10800_socket_count:-0}"
+  remote_codex_exec_count="${remote_codex_exec_count:-0}"
+
+  {
+    printf 'UPDATED=%s\n' "$ts"
+    printf 'REMOTE_HOST=%s\n' "$REMOTE_HOST"
+    printf 'REMOTE_CODEX_EXEC_COUNT=%s\n' "$remote_codex_exec_count"
+    printf 'REMOTE_10800_SOCKET_COUNT=%s\n' "$remote_10800_socket_count"
+    printf 'REMOTE_APP_SERVER_COUNT=%s\n' "${remote_app_count:-0}"
+    printf 'REMOTE_NOTTY_COUNT=%s\n' "${remote_notty_count:-0}"
+    printf '\n'
+    printf '%s\n' "${remote_session_detail:-no codex exec workers}"
+  } > "$SESSIONS_FILE"
 
   status="ok"
   cause="ok"
@@ -353,8 +398,13 @@ LOCAL_7890_IP=$local_http_ip
 REMOTE_SSH_RC=$remote_rc
 REMOTE_SSH_ERROR=$remote_error
 REMOTE_10800_COUNT=${remote_listen:-}
+REMOTE_10800_SOCKET_COUNT=$remote_10800_socket_count
 REMOTE_10800_IP=$remote_proxy_ip
 CHATGPT_CODE=$chatgpt_code
+REMOTE_CODEX_EXEC_COUNT=$remote_codex_exec_count
+REMOTE_APP_SERVER_COUNT=${remote_app_count:-0}
+REMOTE_NOTTY_COUNT=${remote_notty_count:-0}
+SESSIONS_DETAIL_FILE=$SESSIONS_FILE
 DEFAULT_IFACE=$default_iface
 DEFAULT_GATEWAY=$default_gateway
 GCP_IFACE=$gcp_iface
@@ -398,8 +448,10 @@ EOF
   printf '"remote_ssh_rc":%s,' "$remote_rc"
   printf '"remote_ssh_error":"%s",' "$(json_value "$remote_error")"
   printf '"remote_10800_count":%s,' "${remote_listen:-0}"
+  printf '"remote_10800_socket_count":%s,' "${remote_10800_socket_count:-0}"
   printf '"remote_10800_ip":"%s",' "$(json_value "$remote_proxy_ip")"
   printf '"chatgpt_code":"%s",' "$(json_value "$chatgpt_code")"
+  printf '"remote_codex_exec_count":%s,' "${remote_codex_exec_count:-0}"
   printf '"remote_app_server_count":%s,' "${remote_app_count:-0}"
   printf '"remote_notty_count":%s,' "${remote_notty_count:-0}"
   printf '"kinit_status":"%s",' "$(json_value "$status_file_status")"
