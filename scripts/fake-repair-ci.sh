@@ -36,6 +36,8 @@ need_pattern 'title: "刷新 SSH".*refreshSSH' app/kinit-refresh-status.swift
 need_pattern 'trafficSummary' app/kinit-refresh-status.swift
 need_pattern 'TRAFFIC_TODAY_HUMAN' app/kinit-refresh-status.swift
 need_pattern 'TRAFFIC_24H_HUMAN' app/kinit-refresh-status.swift
+need_pattern 'TRAFFIC_RATE_HUMAN' app/kinit-refresh-status.swift
+need_pattern '当前' app/kinit-refresh-status.swift
 need_pattern 'toggleStayAwake' app/kinit-refresh-status.swift
 reject_pattern '强制清理 Remote GCP|完整验证 Remote GCP|打开日志|退出状态栏' app/kinit-refresh-status.swift
 

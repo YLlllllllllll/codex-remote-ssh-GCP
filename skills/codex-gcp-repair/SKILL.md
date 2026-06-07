@@ -27,6 +27,8 @@ REAL_HOME="${REAL_HOME:-/Users/$(id -un)}"
 
 The status-bar app's `修复 GCP` menu item should run the same command. Do not choose alternate repair variants unless the user explicitly asks for debugging.
 
+Manual repair also cleans stale remote state. It may reset local `1080/7890`, remote `10800`, stale SSH tunnel sessions, remote app-server/proxy state, and `codex exec` workers older than `STALE_CODEX_EXEC_MIN_AGE`. It must not blindly kill every remote Codex process, because fresh user work may still be legitimate.
+
 ## Emergency Stop / Cost Control
 
 Use this when the user reports unexpected GCP billing, high traffic, or says no Codex jobs should be running. This stops the local GCP data plane, cleans stale remote `codex exec` workers, and verifies the GCP interface traffic dropped:

@@ -19,10 +19,12 @@ The menu-bar app reads `/tmp/kinit-refresh.status` and exposes:
 - `刷新 SSH`: refresh/verify Kerberos and company SSH only.
 - `保持唤醒` / `关闭防休眠`: toggles the LaunchAgent-backed stay-awake helper.
 
+`修复 GCP` automatically cleans stale remote sessions and processes before rebuilding the proxy path. It removes stale `codex exec` workers older than `STALE_CODEX_EXEC_MIN_AGE`, stale SSH tunnel sessions, and stale app-server/proxy state. It does not blindly kill every Codex process, so fresh real work is not treated as disposable.
+
 The `修复 GCP` menu title also shows read-only GCP traffic counters from the passive monitor:
 
 ```text
-修复 GCP    流量 今日 12.3 MiB / 24h 18.7 MiB
+修复 GCP    流量 今日 12.3 MiB / 24h 18.7 MiB / 当前 32.0 KiB/s
 ```
 
 The displayed total is RX+TX on the GCP VM interface. It is meant as an anomaly indicator: normal text-only Codex usage should stay far below GiB/day; multi-GiB/day means stale sessions or reconnect loops are likely.

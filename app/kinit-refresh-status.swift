@@ -110,6 +110,7 @@ final class StatusApp: NSObject, NSApplicationDelegate {
     private func trafficSummary(_ traffic: [String: String]) -> String {
         let today = traffic["TRAFFIC_TODAY_HUMAN"] ?? "采样中"
         let day = traffic["TRAFFIC_24H_HUMAN"] ?? "采样中"
+        let rate = traffic["TRAFFIC_RATE_HUMAN"] ?? "采样中"
         let status = traffic["TRAFFIC_STATUS"] ?? "unknown"
 
         let prefix: String
@@ -122,7 +123,7 @@ final class StatusApp: NSObject, NSApplicationDelegate {
             prefix = "流量"
         }
 
-        return "\(prefix) 今日 \(today) / 24h \(day)"
+        return "\(prefix) 今日 \(today) / 24h \(day) / 当前 \(rate)"
     }
 
     private func trafficTooltip(_ traffic: [String: String]) -> String {
