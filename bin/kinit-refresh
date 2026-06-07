@@ -422,6 +422,16 @@ verify_codex_chain_clean_fast() {
     return 0
 }
 
+stop_codex_gcp_egress() {
+    if [ ! -x "$CODEX_REFRESH_SCRIPT" ]; then
+        log "失败, Codex 修复脚本不存在或不可执行: $CODEX_REFRESH_SCRIPT"
+        return 127
+    fi
+
+    log "停止并限流 Codex Remote GCP 出口: ${CODEX_REFRESH_SCRIPT} limit-egress"
+    run_with_timeout "$CODEX_TIMEOUT_SECONDS" "$CODEX_REFRESH_SCRIPT" limit-egress
+}
+
 case "${1:-}" in
     status)
         klist 2>&1
@@ -451,6 +461,9 @@ case "${1:-}" in
     ssh|ssh-only|refresh-ssh)
         MODE="ssh-only"
         ;;
+    stop-gcp|stop-egress|limit-gcp|limit-egress)
+        MODE="stop-gcp"
+        ;;
     gcp|remote-gcp|codex-gcp|refresh-gcp|gcp-clean|remote-gcp-clean|codex-gcp-clean|refresh-gcp-clean)
         MODE="remote-gcp"
         ;;
@@ -461,7 +474,7 @@ case "${1:-}" in
         MODE="full"
         ;;
     *)
-        echo "Usage: kinit-refresh [status|log|save-password|delete-password|ssh-only|remote-gcp]" >&2
+        echo "Usage: kinit-refresh [status|log|save-password|delete-password|ssh-only|remote-gcp|stop-gcp]" >&2
         exit 2
         ;;
 esac
@@ -475,6 +488,26 @@ if ! acquire_lock; then
 fi
 
 trap cleanup EXIT
+
+if [ "$MODE" = "stop-gcp" ]; then
+    EXP=$(klist 2>/dev/null | awk '/krbtgt/ {print $5, $6, $7, $8; exit}')
+    log "kinit-refresh stop-gcp 启动 (codex_timeout=${CODEX_TIMEOUT_SECONDS}s, ssh_probe=${SSH_PROBE_TARGET})"
+    write_status "running" "ok" "stopping" "stopping" "$EXP" "正在停止 Codex Remote GCP 出口并清理 stale worker"
+
+    stop_codex_gcp_egress
+    RC=$?
+    if [ "$RC" -eq 0 ]; then
+        log "成功, Codex Remote GCP 出口已停止, stale worker 已清理"
+        write_status "stopped" "ok" "stopped" "stopped" "$EXP" "GCP出口已停止；本地1080/7890关闭，远端stale codex exec已清理"
+        [ -t 1 ] && echo "GCP 出口已停止"
+        exit 0
+    fi
+
+    log "stop-gcp 失败, 退出码 ${RC}"
+    write_status "warning" "ok" "unknown" "unknown" "$EXP" "停止 GCP 出口未完全验证, 退出码 ${RC}"
+    [ -t 1 ] && echo "GCP 出口停止未完全验证 (exit ${RC}), 详见 ${LOG_FILE}"
+    exit "$RC"
+fi
 
 if [ "$MODE" = "ssh-only" ]; then
     EXP=$(klist 2>/dev/null | awk '/krbtgt/ {print $5, $6, $7, $8; exit}')

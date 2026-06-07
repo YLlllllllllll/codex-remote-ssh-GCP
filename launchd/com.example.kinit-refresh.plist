@@ -9,11 +9,13 @@
     <!-- 调用统一的 ~/bin/kinit-refresh 脚本,行为与手动执行完全一致 -->
     <key>ProgramArguments</key>
     <array>
-        <string>@/bin/kinit-refresh</string>
+        <string>@HOME@/bin/kinit-refresh</string>
+        <string>ssh-only</string>
     </array>
 
-    <!-- 每 10 分钟高频刷新/探活一次 (600s)
+    <!-- 每 10 分钟只刷新/探活 Kerberos 与 SSH (600s)
          token 有效期 24h,即使错过多次也有缓冲
+         GCP 出口只能通过菜单/手动 kinit-refresh remote-gcp 打开
          StartInterval 在睡眠期间错过的任务,唤醒后会尽快补跑 -->
     <key>StartInterval</key>
     <integer>600</integer>

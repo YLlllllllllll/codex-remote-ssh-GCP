@@ -41,8 +41,12 @@ kinit-refresh save-password
 kinit-refresh status
 kinit-refresh ssh-only
 kinit-refresh remote-gcp
+kinit-refresh stop-gcp
 kinit-refresh log
 codex-gcp-remote diagnose
+codex-gcp-remote limit-egress
+codex-gcp-remote clean-workers
+codex-gcp-remote traffic-sample 20
 codex-gcp-remote clean-repair-fast
 codex-gcp-remote verify-fast
 ```
@@ -89,7 +93,17 @@ scripts/fake-repair-ci.sh
 The GCP VM is an egress proxy. Cost is usually dominated by network traffic, not CPU. Stop the tunnel when it is not needed:
 
 ```bash
-kill "$(lsof -tiTCP:1080 -sTCP:LISTEN)" "$(lsof -tiTCP:7890 -sTCP:LISTEN)" 2>/dev/null || true
+kinit-refresh stop-gcp
+```
+
+That disables remote Codex GCP egress until `kinit-refresh remote-gcp` is run again. It also cleans stale remote `codex exec` workers older than `STALE_CODEX_EXEC_MIN_AGE` and samples the GCP VM interface to verify the traffic drop.
+
+Manual lower-level commands:
+
+```bash
+codex-gcp-remote stop-egress
+codex-gcp-remote clean-workers
+codex-gcp-remote traffic-sample 20
 ```
 
 See `docs/network-matrix.md` and `docs/cost-notes.md`.

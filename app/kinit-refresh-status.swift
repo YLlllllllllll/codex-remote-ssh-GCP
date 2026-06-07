@@ -49,13 +49,14 @@ final class StatusApp: NSObject, NSApplicationDelegate {
         let isStale = updatedEpoch == 0 || Date().timeIntervalSince1970 - updatedEpoch > staleSeconds
 
         let icon: String
-        let proxySatisfied = proxy == "ok" || proxy == "skipped"
-        let codexSatisfied = codex == "ok" || codex == "skipped"
-
         if isStale {
             icon = "🔴"
-        } else if status == "ok" && ssh == "ok" && proxySatisfied && codexSatisfied {
+        } else if status == "ok" && ssh == "ok" && proxy == "ok" && codex == "ok" {
             icon = "🟢"
+        } else if status == "stopped" || proxy == "stopped" || codex == "stopped" {
+            icon = "⚪"
+        } else if status == "ok" && ssh == "ok" && (proxy == "skipped" || codex == "skipped") {
+            icon = "⚪"
         } else if status == "running" || status == "warning" {
             icon = "🟡"
         } else {

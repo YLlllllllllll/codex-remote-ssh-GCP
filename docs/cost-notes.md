@@ -21,7 +21,22 @@ lsof -nP -iTCP:1080 -iTCP:7890
 To stop egress immediately:
 
 ```bash
-kill "$(lsof -tiTCP:1080 -sTCP:LISTEN)" "$(lsof -tiTCP:7890 -sTCP:LISTEN)" 2>/dev/null || true
+kinit-refresh stop-gcp
 ```
 
 That disables remote Codex GCP egress until `kinit-refresh remote-gcp` is run again.
+
+Lower-level controls:
+
+```bash
+codex-gcp-remote stop-egress       # stop local 1080/7890 only
+codex-gcp-remote clean-workers     # kill stale remote codex exec workers
+codex-gcp-remote traffic-sample 20 # sample GCP interface counters
+codex-gcp-remote limit-egress      # stop, clean, then verify traffic drop
+```
+
+Default guardrails:
+
+- `STALE_CODEX_EXEC_MIN_AGE=1800`: only stale remote `codex exec` workers older than 30 minutes are cleaned.
+- `GCP_TRAFFIC_SAMPLE_SECONDS=20`: traffic verification sample window.
+- `GCP_TRAFFIC_LIMIT_BYTES=10485760`: total RX+TX bytes allowed during the sample before the command exits non-zero.

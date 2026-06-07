@@ -37,10 +37,18 @@ reject_pattern '强制清理 Remote GCP|完整验证 Remote GCP|打开日志|退
 
 printf '== repair command contract ==\n'
 need_pattern 'gcp\|remote-gcp\|codex-gcp\|refresh-gcp' bin/kinit-refresh
+need_pattern 'stop-gcp\|stop-egress\|limit-gcp\|limit-egress' bin/kinit-refresh
+need_pattern 'stop_codex_gcp_egress' bin/kinit-refresh
 need_pattern 'verify_codex_chain_clean_fast' bin/kinit-refresh
 need_pattern 'clean-repair-fast' bin/codex-gcp-remote
+need_pattern 'stop-egress' bin/codex-gcp-remote
+need_pattern 'limit-egress' bin/codex-gcp-remote
+need_pattern 'clean-workers' bin/codex-gcp-remote
+need_pattern 'traffic-sample' bin/codex-gcp-remote
 need_pattern 'force_reset_local_proxy' bin/codex-gcp-remote
 need_pattern 'force_reset_remote_proxy' bin/codex-gcp-remote
+need_pattern 'clean_stale_remote_codex_exec' bin/codex-gcp-remote
+need_pattern 'STALE_CODEX_EXEC_MIN_AGE' bin/codex-gcp-remote
 need_pattern 'restart_remote_codex_app_server' bin/codex-gcp-remote
 need_pattern 'start_remote_forward' bin/codex-gcp-remote
 
@@ -65,6 +73,7 @@ order = [
     "restart_remote_codex_app_server",
     "start_local_socks",
     "start_local_http",
+    "clean_stale_remote_codex_exec",
     "start_remote_forward",
 ]
 positions = [body.index(item) for item in order]

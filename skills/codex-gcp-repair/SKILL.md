@@ -27,6 +27,33 @@ REAL_HOME="${REAL_HOME:-/Users/$(id -un)}"
 
 The status-bar app's `修复 GCP` menu item should run the same command. Do not choose alternate repair variants unless the user explicitly asks for debugging.
 
+## Emergency Stop / Cost Control
+
+Use this when the user reports unexpected GCP billing, high traffic, or says no Codex jobs should be running. This stops the local GCP data plane, cleans stale remote `codex exec` workers, and verifies the GCP interface traffic dropped:
+
+```bash
+REAL_HOME="$(dscl . -read "/Users/$(id -un)" NFSHomeDirectory 2>/dev/null | awk '{print $2; exit}')"
+REAL_HOME="${REAL_HOME:-/Users/$(id -un)}"
+"$REAL_HOME/bin/kinit-refresh" stop-gcp
+```
+
+Then validate:
+
+```bash
+lsof -nP -iTCP:1080 -sTCP:LISTEN
+lsof -nP -iTCP:7890 -sTCP:LISTEN
+"$REAL_HOME/bin/codex-gcp-remote" traffic-sample 20
+ssh codex-candy-workspace 'ps -eo args | awk "/codex exec/ && !/awk/ {c++} END {print c+0}"'
+```
+
+Expected result:
+
+- No local `1080` or `7890` listener.
+- `traffic-sample` reports `traffic_status=ok` with only small byte deltas.
+- Remote stale `codex exec` count is `0`, or only fresh jobs younger than `STALE_CODEX_EXEC_MIN_AGE` remain.
+
+Important: scheduled Kerberos refresh must run `kinit-refresh ssh-only`, not bare `kinit-refresh`, otherwise it will periodically reopen the GCP tunnel.
+
 ## Fake Repair CI
 
 Use this for script/app/skill edits and for your own validation. It must be the default test path because it does not kill processes, change routes, bind ports, SSH to the remote workspace, or touch Codex.app:

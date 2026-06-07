@@ -85,6 +85,10 @@ REMOTE_FORWARD_VERIFY_DELAY="${REMOTE_FORWARD_VERIFY_DELAY:-2}"
 VERIFY_FAST_ATTEMPTS="${VERIFY_FAST_ATTEMPTS:-6}"
 VERIFY_FAST_DELAY="${VERIFY_FAST_DELAY:-2}"
 STALE_REMOTE_SSHD_MIN_AGE="${STALE_REMOTE_SSHD_MIN_AGE:-5}"
+STALE_CODEX_EXEC_MIN_AGE="${STALE_CODEX_EXEC_MIN_AGE:-1800}"
+GCP_TRAFFIC_IFACE="${GCP_TRAFFIC_IFACE:-ens4}"
+GCP_TRAFFIC_SAMPLE_SECONDS="${GCP_TRAFFIC_SAMPLE_SECONDS:-20}"
+GCP_TRAFFIC_LIMIT_BYTES="${GCP_TRAFFIC_LIMIT_BYTES:-10485760}"
 
 STATE_DIR="${STATE_DIR:-$LOCAL_HOME/.codex-gcp-tunnel}"
 PRIVOXY_CONF="$STATE_DIR/privoxy.conf"
@@ -106,6 +110,15 @@ Commands:
   clean-repair-fast
              Force reset local 1080/7890, remote 10800, stale SSH sessions,
              and remote Codex app-server, then rebuild the fast path.
+  stop-egress
+             Stop local 1080/7890 GCP data plane without touching Codex.app.
+  limit-egress
+             Stop local GCP data plane, clean stale remote codex exec workers,
+             and sample GCP traffic to verify the bleed stopped.
+  clean-workers
+             Kill remote codex exec workers older than STALE_CODEX_EXEC_MIN_AGE.
+  traffic-sample [seconds]
+             Sample GCP VM network counters for the configured interface.
   verify     Run direct SSH remote Codex validation, including openai-ok.
   verify-fast
              Verify remote 10800 egress and ChatGPT endpoint reachability.
@@ -261,6 +274,17 @@ ssh_remote_quiet() {
     -o ServerAliveInterval=5 \
     -o ServerAliveCountMax=1 \
     "$REMOTE_HOST" "$@" 2>/dev/null
+}
+
+ssh_gcp() {
+  ssh \
+    -i "$GCP_KEY" \
+    -o IdentitiesOnly=yes \
+    -p "$GCP_PORT" \
+    -o BatchMode=yes \
+    -o ConnectTimeout=10 \
+    -o ConnectionAttempts=1 \
+    "${GCP_USER}@${GCP_HOST}" "$@"
 }
 
 remote_proxy_ip_once() {
@@ -690,11 +714,125 @@ done
 REMOTE
 }
 
+clean_stale_remote_codex_exec() {
+  section "Clean stale remote codex exec workers"
+  ssh_remote "STALE_CODEX_EXEC_MIN_AGE='$STALE_CODEX_EXEC_MIN_AGE' bash -s" <<'REMOTE' || true
+set -Eeuo pipefail
+
+victims="$(ps -eo pid=,ppid=,etimes=,etime=,pcpu=,pmem=,args= 2>/dev/null | awk -v min_age="$STALE_CODEX_EXEC_MIN_AGE" '
+  /\/bin\/codex exec/ && $0 !~ /awk / {
+    pid=$1
+    age=$3
+    if (age >= min_age) {
+      print pid
+    }
+  }
+')"
+
+if [ -z "$victims" ]; then
+  echo "no stale codex exec workers older than ${STALE_CODEX_EXEC_MIN_AGE}s"
+  exit 0
+fi
+
+echo "stale codex exec cleanup list:"
+ps -eo pid=,ppid=,etimes=,etime=,pcpu=,pmem=,args= 2>/dev/null | awk -v ids=" $victims " '
+  index(ids, " " $1 " ") {
+    print
+  }
+'
+
+echo "TERM stale codex exec pids: $(echo "$victims" | tr '\n' ' ')"
+kill $victims 2>/dev/null || true
+sleep 3
+
+left="$(ps -eo pid=,args= 2>/dev/null | awk -v ids=" $victims " '
+  /\/bin\/codex exec/ && $0 !~ /awk / && index(ids, " " $1 " ") {
+    print $1
+  }
+')"
+
+if [ -n "$left" ]; then
+  echo "KILL stale codex exec survivors: $(echo "$left" | tr '\n' ' ')"
+  kill -9 $left 2>/dev/null || true
+fi
+
+remaining="$(ps -eo pid=,args= 2>/dev/null | awk '/\/bin\/codex exec/ && $0 !~ /awk / {count++} END {print count + 0}')"
+echo "remaining codex exec workers: ${remaining}"
+REMOTE
+}
+
 force_reset_local_proxy() {
   section "Force reset local 1080/7890"
   kill_listeners "$LOCAL_HTTP_PORT"
   kill_listeners "$LOCAL_SOCKS_PORT"
   rm -f "$STATE_DIR/gcp-socks.manual.pid" "$STATE_DIR/privoxy.manual.pid" 2>/dev/null || true
+}
+
+stop_gcp_egress() {
+  section "Stop local GCP egress data plane"
+  kill_listeners "$LOCAL_HTTP_PORT"
+  kill_listeners "$LOCAL_SOCKS_PORT"
+  rm -f "$STATE_DIR/gcp-socks.manual.pid" "$STATE_DIR/privoxy.manual.pid" 2>/dev/null || true
+  printf 'local %s/%s listeners after stop:\n' "$LOCAL_SOCKS_PORT" "$LOCAL_HTTP_PORT"
+  lsof -nP -iTCP:"$LOCAL_SOCKS_PORT" -sTCP:LISTEN || true
+  lsof -nP -iTCP:"$LOCAL_HTTP_PORT" -sTCP:LISTEN || true
+}
+
+traffic_sample() {
+  local seconds="${1:-$GCP_TRAFFIC_SAMPLE_SECONDS}"
+  case "$seconds" in
+    ''|*[!0-9]*)
+      printf 'ERROR: traffic sample seconds must be a positive integer\n' >&2
+      exit 2
+      ;;
+  esac
+  if [[ "$seconds" -lt 1 ]]; then
+    printf 'ERROR: traffic sample seconds must be >= 1\n' >&2
+    exit 2
+  fi
+
+  section "GCP traffic sample (${GCP_TRAFFIC_IFACE}, ${seconds}s)"
+  ssh_gcp "iface='$GCP_TRAFFIC_IFACE' seconds='$seconds' limit='$GCP_TRAFFIC_LIMIT_BYTES' bash -s" <<'REMOTE'
+set -Eeuo pipefail
+
+read_counters() {
+  awk -v iface="$iface:" '$1 == iface { print $2, $10; found=1 } END { exit found ? 0 : 1 }' /proc/net/dev
+}
+
+before="$(read_counters)"
+rx1="${before%% *}"
+tx1="${before##* }"
+sleep "$seconds"
+after="$(read_counters)"
+rx2="${after%% *}"
+tx2="${after##* }"
+
+delta_rx=$((rx2 - rx1))
+delta_tx=$((tx2 - tx1))
+total=$((delta_rx + delta_tx))
+rx_bps=$((delta_rx / seconds))
+tx_bps=$((delta_tx / seconds))
+total_bps=$((total / seconds))
+
+printf 'rx_delta_bytes=%s\n' "$delta_rx"
+printf 'tx_delta_bytes=%s\n' "$delta_tx"
+printf 'total_delta_bytes=%s\n' "$total"
+printf 'rx_bytes_per_sec=%s\n' "$rx_bps"
+printf 'tx_bytes_per_sec=%s\n' "$tx_bps"
+printf 'total_bytes_per_sec=%s\n' "$total_bps"
+
+if [ "$total" -gt "$limit" ]; then
+  printf 'traffic_status=over_limit\n'
+  exit 1
+fi
+printf 'traffic_status=ok\n'
+REMOTE
+}
+
+limit_egress() {
+  stop_gcp_egress
+  clean_stale_remote_codex_exec
+  traffic_sample "$GCP_TRAFFIC_SAMPLE_SECONDS"
 }
 
 force_reset_remote_proxy() {
@@ -872,6 +1010,7 @@ repair() {
   start_local_http
   ensure_remote_wrappers
   kill_stale_remote_processes
+  clean_stale_remote_codex_exec
   start_remote_forward
   section "Repair complete"
   printf 'Run final validation with: %s verify\n' "$(basename "$0")"
@@ -880,6 +1019,7 @@ repair() {
 repair_fast() {
   start_local_socks
   start_local_http
+  clean_stale_remote_codex_exec
   SKIP_REMOTE_PLAIN_CHECK=1
   start_remote_forward
   section "Fast repair complete"
@@ -893,6 +1033,7 @@ clean_repair_fast() {
   restart_remote_codex_app_server
   start_local_socks
   start_local_http
+  clean_stale_remote_codex_exec
   SKIP_REMOTE_PLAIN_CHECK=1
   start_remote_forward
   section "Clean fast repair complete"
@@ -991,6 +1132,18 @@ case "$cmd" in
     ;;
   clean-repair-fast)
     clean_repair_fast
+    ;;
+  stop-egress)
+    stop_gcp_egress
+    ;;
+  limit-egress)
+    limit_egress
+    ;;
+  clean-workers)
+    clean_stale_remote_codex_exec
+    ;;
+  traffic-sample)
+    traffic_sample "${2:-$GCP_TRAFFIC_SAMPLE_SECONDS}"
     ;;
   verify)
     verify
