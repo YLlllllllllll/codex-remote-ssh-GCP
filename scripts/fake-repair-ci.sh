@@ -24,7 +24,7 @@ reject_pattern() {
 }
 
 printf '== static syntax ==\n'
-bash -n bin/kinit-refresh bin/codex-gcp-remote bin/codex-gcp-monitor bin/stay-awake.sh scripts/install.sh scripts/fake-repair-ci.sh scripts/live-egress-ci.sh
+bash -n bin/kinit-refresh bin/codex-gcp-remote bin/codex-gcp-monitor bin/codex-workspace-proxy bin/stay-awake.sh scripts/install.sh scripts/fake-repair-ci.sh scripts/live-egress-ci.sh
 bin/codex-gcp-monitor self-test
 swiftc -parse app/kinit-refresh-status.swift
 plutil -lint launchd/com.example.kinit-refresh.plist launchd/com.example.kinit-refresh-status.plist launchd/com.example.stay-awake.plist launchd/com.example.codex-gcp-monitor.plist >/dev/null
@@ -49,6 +49,12 @@ need_pattern 'toggleStayAwake' app/kinit-refresh-status.swift
 reject_pattern '强制清理 Remote GCP|完整验证 Remote GCP|打开日志|退出状态栏' app/kinit-refresh-status.swift
 
 printf '== repair command contract ==\n'
+need_pattern 'codex-workspace-proxy' scripts/install.sh
+need_pattern 'WORKSPACE_JUMP_HOST' bin/codex-workspace-proxy
+need_pattern 'JUMP_PROXY_SERVICE' bin/codex-workspace-proxy
+need_pattern '/usr/bin/nc -G' bin/codex-workspace-proxy
+need_pattern '^[[:space:]]*-4' bin/codex-workspace-proxy
+need_pattern '^[[:space:]]*-6' bin/codex-workspace-proxy
 need_pattern 'gcp\|remote-gcp\|codex-gcp\|refresh-gcp' bin/kinit-refresh
 need_pattern 'stop-gcp\|stop-egress\|limit-gcp\|limit-egress' bin/kinit-refresh
 need_pattern 'stop_codex_gcp_egress' bin/kinit-refresh

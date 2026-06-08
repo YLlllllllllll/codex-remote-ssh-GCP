@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+target_host="${1:?target host required}"
+target_port="${2:?target port required}"
+
+LOCAL_USER="$(id -un)"
+LOCAL_HOME="${LOCAL_HOME:-$(dscl . -read "/Users/${LOCAL_USER}" NFSHomeDirectory 2>/dev/null | awk '{ print $2; exit }')}"
+LOCAL_HOME="${LOCAL_HOME:-$HOME}"
+export HOME="$LOCAL_HOME"
+
+CONFIG_FILE="${CODEX_GCP_REFRESH_CONFIG:-$LOCAL_HOME/.config/codex-gcp-refresh/config.env}"
+if [[ -f "$CONFIG_FILE" ]]; then
+  # shellcheck disable=SC1090
+  . "$CONFIG_FILE"
+fi
+
+direct_timeout="${WORKSPACE_DIRECT_TIMEOUT_SECONDS:-3}"
+jump_timeout="${WORKSPACE_JUMP_TIMEOUT_SECONDS:-8}"
+jump_host="${WORKSPACE_JUMP_HOST:-}"
+
+if [[ -z "$jump_host" && "${JUMP_PROXY_SERVICE:-}" == host/*@* ]]; then
+  jump_host="${JUMP_PROXY_SERVICE#host/}"
+  jump_host="${jump_host%@*}"
+fi
+jump_host="${jump_host:-jump-proxy.example.com}"
+
+if /usr/bin/nc -G "$direct_timeout" -z "$target_host" "$target_port" >/dev/null 2>&1; then
+  exec /usr/bin/nc -G "$jump_timeout" "$target_host" "$target_port"
+fi
+
+if /usr/bin/nc -4 -G "$direct_timeout" -z "$jump_host" 22 >/dev/null 2>&1; then
+  /usr/bin/ssh \
+    -4 \
+    -o BatchMode=yes \
+    -o ConnectTimeout="$jump_timeout" \
+    -o ConnectionAttempts=1 \
+    -W "${target_host}:${target_port}" \
+    "$jump_host" && exit 0
+fi
+
+exec /usr/bin/ssh \
+  -6 \
+  -o BatchMode=yes \
+  -o ConnectTimeout="$jump_timeout" \
+  -o ConnectionAttempts=1 \
+  -W "${target_host}:${target_port}" \
+  "$jump_host"

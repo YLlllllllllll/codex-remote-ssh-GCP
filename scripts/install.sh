@@ -19,6 +19,7 @@ fi
 install -m 0755 "$ROOT/bin/kinit-refresh" "$BIN_DIR/kinit-refresh"
 install -m 0755 "$ROOT/bin/codex-gcp-remote" "$BIN_DIR/codex-gcp-remote"
 install -m 0755 "$ROOT/bin/codex-gcp-monitor" "$BIN_DIR/codex-gcp-monitor"
+install -m 0755 "$ROOT/bin/codex-workspace-proxy" "$BIN_DIR/codex-workspace-proxy"
 install -m 0755 "$ROOT/bin/stay-awake.sh" "$BIN_DIR/stay-awake.sh"
 
 swiftc "$ROOT/app/kinit-refresh-status.swift" -o "$BIN_DIR/kinit-refresh-status"
