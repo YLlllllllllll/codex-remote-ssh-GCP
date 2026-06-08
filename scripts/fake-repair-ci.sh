@@ -25,6 +25,7 @@ reject_pattern() {
 
 printf '== static syntax ==\n'
 bash -n bin/kinit-refresh bin/codex-gcp-remote bin/codex-gcp-monitor bin/stay-awake.sh scripts/install.sh scripts/fake-repair-ci.sh scripts/live-egress-ci.sh
+bin/codex-gcp-monitor self-test
 swiftc -parse app/kinit-refresh-status.swift
 plutil -lint launchd/com.example.kinit-refresh.plist launchd/com.example.kinit-refresh-status.plist launchd/com.example.stay-awake.plist launchd/com.example.codex-gcp-monitor.plist >/dev/null
 python3 -m py_compile tools/codex-http-to-socks.py
@@ -75,9 +76,10 @@ need_pattern 'STALE_CODEX_EXEC_MIN_AGE=1' scripts/live-egress-ci.sh
 reject_pattern '/home/tiger/.local.*/codex exec|/Applications/Codex.app|launchctl setenv|open -a Codex' scripts/live-egress-ci.sh
 
 printf '== passive monitor contract ==\n'
-need_pattern 'codex-gcp-monitor \[sample\|status\|tail \[n\]\|path\]' bin/codex-gcp-monitor
+need_pattern 'codex-gcp-monitor \[sample\|status\|tail \[n\]\|path\|self-test\]' bin/codex-gcp-monitor
 need_pattern 'monitor.jsonl' bin/codex-gcp-monitor
 need_pattern 'monitor-latest.env' bin/codex-gcp-monitor
+need_pattern 'gcp_counter_ok' bin/codex-gcp-monitor
 need_pattern 'GCP_RX_BYTES' bin/codex-gcp-monitor
 need_pattern 'TRAFFIC_TODAY_BYTES' bin/codex-gcp-monitor
 need_pattern 'TRAFFIC_24H_BYTES' bin/codex-gcp-monitor
