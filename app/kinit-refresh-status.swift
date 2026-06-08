@@ -56,11 +56,15 @@ final class StatusApp: NSObject, NSApplicationDelegate {
         let updated = data["UPDATED"] ?? "unknown"
         let updatedEpoch = TimeInterval(data["UPDATED_EPOCH"] ?? "") ?? 0
         let isStale = updatedEpoch == 0 || Date().timeIntervalSince1970 - updatedEpoch > staleSeconds
+        let monitorGcpOk = traffic["STATUS"] == "ok"
+            && traffic["LOCAL_1080_COUNT"] != "0"
+            && traffic["LOCAL_7890_COUNT"] != "0"
+            && traffic["REMOTE_10800_COUNT"] != "0"
 
         let icon: String
         if isStale {
             icon = "🔴"
-        } else if status == "ok" && ssh == "ok" && proxy == "ok" && codex == "ok" {
+        } else if status == "ok" && ssh == "ok" && (proxy == "ok" && codex == "ok" || monitorGcpOk) {
             icon = "🟢"
         } else if status == "stopped" || proxy == "stopped" || codex == "stopped" {
             icon = "⚪"
@@ -78,7 +82,8 @@ final class StatusApp: NSObject, NSApplicationDelegate {
         statusItem.button?.title = title
         statusItem.button?.toolTip = "kinit-refresh: \(message) | SSH: \(ssh) | Proxy: \(proxy) | Codex: \(codex) | Exp: \(shortExp) | \(trafficLabel)"
 
-        summaryItem.title = "\(title) | SSH: \(ssh) | \(message)"
+        let gcpState = monitorGcpOk ? "GCP 可用" : message
+        summaryItem.title = "\(title) | SSH: \(ssh) | \(gcpState)"
         summaryItem.toolTip = "Proxy: \(proxy) | Codex: \(codex) | 更新: \(updated) | \(trafficLabel)"
         refreshGCPItem.title = "修复 GCP    \(trafficLabel)"
         refreshGCPItem.toolTip = trafficTooltip(traffic)
@@ -127,11 +132,11 @@ final class StatusApp: NSObject, NSApplicationDelegate {
         let prefix: String
         switch status {
         case "critical":
-            prefix = "流量异常"
+            prefix = "本地流量异常"
         case "warning":
-            prefix = "流量偏高"
+            prefix = "本地流量偏高"
         default:
-            prefix = "流量"
+            prefix = "本地流量"
         }
 
         return "\(prefix) 今日 \(today) / 24h \(day) / 当前 \(rate)"
@@ -143,7 +148,7 @@ final class StatusApp: NSObject, NSApplicationDelegate {
         let iface = traffic["GCP_COUNTER_IFACE"] ?? "unknown"
         let rx = traffic["GCP_RX_BYTES"] ?? "unknown"
         let tx = traffic["GCP_TX_BYTES"] ?? "unknown"
-        return "\(trafficSummary(traffic)) | 当前速率 \(rate) | iface \(iface) | RX \(rx) | TX \(tx) | 更新 \(updated)"
+        return "\(trafficSummary(traffic)) | 当前速率 \(rate) | iface \(iface) | RX \(rx) | TX \(tx) | 更新 \(updated) | 本地采样, 不是账单明细"
     }
 
     private func updateSessionsMenu(traffic: [String: String], sessions: String) {
