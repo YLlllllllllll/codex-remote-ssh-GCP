@@ -60,6 +60,9 @@ need_pattern '/usr/bin/nc -G' bin/codex-workspace-proxy
 need_pattern '^[[:space:]]*-4' bin/codex-workspace-proxy
 need_pattern '^[[:space:]]*-6' bin/codex-workspace-proxy
 need_pattern 'gcp\|remote-gcp\|codex-gcp\|refresh-gcp' bin/kinit-refresh
+need_pattern 'KINIT_LIFETIME' bin/kinit-refresh
+need_pattern 'KINIT_RENEWABLE_LIFE' bin/kinit-refresh
+need_pattern 'run_single_kinit_with_timeout' bin/kinit-refresh
 need_pattern 'stop-gcp\|stop-egress\|limit-gcp\|limit-egress' bin/kinit-refresh
 need_pattern 'stop_codex_gcp_egress' bin/kinit-refresh
 need_pattern 'verify_codex_chain_clean_fast' bin/kinit-refresh

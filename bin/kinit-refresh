@@ -36,6 +36,8 @@ RETRY_DELAY_SECONDS=15
 LOCK_STALE_SECONDS=600
 KINIT_KEYCHAIN_SERVICE="${KINIT_KEYCHAIN_SERVICE:-example-kinit-refresh}"
 KINIT_KEYCHAIN_ACCOUNT="${KINIT_KEYCHAIN_ACCOUNT:-$PRINCIPAL}"
+KINIT_LIFETIME="${KINIT_LIFETIME:-24h}"
+KINIT_RENEWABLE_LIFE="${KINIT_RENEWABLE_LIFE:-7d}"
 JUMP_PROXY_SERVICE="${JUMP_PROXY_SERVICE:-host/jump-proxy.example.com@REALM.EXAMPLE}"
 SSH_PROBE_TARGET="${SSH_PROBE_TARGET:-remote-workspace}"
 CODEX_REFRESH_SCRIPT="${CODEX_REFRESH_SCRIPT:-$LOCAL_HOME/bin/codex-gcp-remote}"
@@ -172,17 +174,23 @@ acquire_lock() {
     return 1
 }
 
-run_kinit_with_timeout() {
-    local keychain_password
-    keychain_password=$(/usr/bin/security find-generic-password \
-        -a "$KINIT_KEYCHAIN_ACCOUNT" \
-        -s "$KINIT_KEYCHAIN_SERVICE" \
-        -w 2>/dev/null || true)
+run_single_kinit_with_timeout() {
+    local keychain_password=$1
+    local use_renewable=$2
+    local -a args=()
+
+    if [ -n "$KINIT_LIFETIME" ]; then
+        args+=("-l" "$KINIT_LIFETIME")
+    fi
+    if [ "$use_renewable" = "yes" ] && [ -n "$KINIT_RENEWABLE_LIFE" ]; then
+        args+=("-r" "$KINIT_RENEWABLE_LIFE")
+    fi
+    args+=("$PRINCIPAL")
 
     if [ -n "$keychain_password" ]; then
-        (printf '%s\n' "$keychain_password" | /usr/bin/kinit "$PRINCIPAL" >/dev/null 2>&1) &
+        (printf '%s\n' "$keychain_password" | /usr/bin/kinit "${args[@]}" >/dev/null 2>&1) &
     else
-        /usr/bin/kinit "$PRINCIPAL" </dev/null &
+        /usr/bin/kinit "${args[@]}" </dev/null &
     fi
     local pid=$!
     local elapsed=0
@@ -197,6 +205,25 @@ run_kinit_with_timeout() {
     done
 
     wait "$pid"
+}
+
+run_kinit_with_timeout() {
+    local keychain_password rc
+    keychain_password=$(/usr/bin/security find-generic-password \
+        -a "$KINIT_KEYCHAIN_ACCOUNT" \
+        -s "$KINIT_KEYCHAIN_SERVICE" \
+        -w 2>/dev/null || true)
+
+    if [ -n "$KINIT_RENEWABLE_LIFE" ]; then
+        run_single_kinit_with_timeout "$keychain_password" yes
+        rc=$?
+        if [ "$rc" -eq 0 ]; then
+            return 0
+        fi
+        log "renewable kinit 失败(exit=${rc}, renewable_life=${KINIT_RENEWABLE_LIFE}), 回退普通 kinit"
+    fi
+
+    run_single_kinit_with_timeout "$keychain_password" no
 }
 
 keychain_password_available() {

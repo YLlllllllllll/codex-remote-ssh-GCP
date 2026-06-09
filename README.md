@@ -48,6 +48,8 @@ scripts/install.sh
 kinit-refresh save-password
 ```
 
+By default the helper requests a `24h` Kerberos ticket with a `7d` renewable window (`KINIT_LIFETIME=24h`, `KINIT_RENEWABLE_LIFE=7d`). The company KDC policy is authoritative: if renewable tickets are not allowed, the script falls back to a normal kinit so SSH recovery still works when the company network is reachable.
+
 ## Manual Commands
 
 ```bash
