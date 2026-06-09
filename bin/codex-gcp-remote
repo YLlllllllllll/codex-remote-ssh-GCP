@@ -94,6 +94,9 @@ GCP_TRAFFIC_LIMIT_BYTES="${GCP_TRAFFIC_LIMIT_BYTES:-10485760}"
 STATE_DIR="${STATE_DIR:-$LOCAL_HOME/.codex-gcp-tunnel}"
 PRIVOXY_CONF="$STATE_DIR/privoxy.conf"
 REMOTE_CONTROL_PATH="$STATE_DIR/remote-forward.cm"
+REMOTE_FORWARD_PID_FILE="$STATE_DIR/remote-forward.manual.pid"
+REMOTE_FORWARD_LABEL="${REMOTE_FORWARD_LABEL:-com.example.codex-gcp-forward}"
+REMOTE_FORWARD_PLIST="${REMOTE_FORWARD_PLIST:-$LOCAL_HOME/Library/LaunchAgents/${REMOTE_FORWARD_LABEL}.plist}"
 
 LOCAL_SOCKS_URL="socks5h://${LOCAL_SOCKS_HOST}:${LOCAL_SOCKS_PORT}"
 LOCAL_HTTP_URL="http://${LOCAL_HTTP_HOST}:${LOCAL_HTTP_PORT}"
@@ -332,10 +335,9 @@ reset_remote_forward_controlmasters() {
     ssh -S "$configured_control_path" -O cancel \
       -R "${REMOTE_HTTP_HOST}:${REMOTE_HTTP_PORT}:${LOCAL_HTTP_HOST}:${LOCAL_HTTP_PORT}" \
       "$REMOTE_HOST" >/dev/null 2>&1 || true
-    ssh -S "$configured_control_path" -O exit "$REMOTE_HOST" >/dev/null 2>&1 || true
-    rm -f "$configured_control_path" 2>/dev/null || true
   fi
 
+  stop_dedicated_remote_forward
   ssh -S "$REMOTE_CONTROL_PATH" -O exit "$REMOTE_HOST" >/dev/null 2>&1 || true
   rm -f "$REMOTE_CONTROL_PATH" "$STATE_DIR/remote-forward.manual.log" 2>/dev/null || true
 }
@@ -420,6 +422,42 @@ request_remote_forward_on_controlmaster() {
     -o ConnectionAttempts=1 \
     -o ExitOnForwardFailure=yes \
     "$REMOTE_HOST" 2>&1 || true
+}
+
+stop_dedicated_remote_forward() {
+  local uid
+  uid="$(id -u)"
+  launchctl bootout "gui/$uid" "$REMOTE_FORWARD_PLIST" >/dev/null 2>&1 || true
+  launchctl remove "$REMOTE_FORWARD_LABEL" >/dev/null 2>&1 || true
+
+  local pid
+  pid="$(cat "$REMOTE_FORWARD_PID_FILE" 2>/dev/null || true)"
+  if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null || true
+    sleep 1
+    kill -9 "$pid" 2>/dev/null || true
+  fi
+  rm -f "$REMOTE_FORWARD_PID_FILE" 2>/dev/null || true
+}
+
+start_dedicated_remote_forward() {
+  if [[ ! -f "$REMOTE_FORWARD_PLIST" ]]; then
+    printf 'ERROR: remote forward LaunchAgent plist missing: %s\n' "$REMOTE_FORWARD_PLIST" >&2
+    exit 1
+  fi
+
+  local uid
+  uid="$(id -u)"
+  stop_dedicated_remote_forward
+  launchctl bootstrap "gui/$uid" "$REMOTE_FORWARD_PLIST" >/dev/null 2>&1 || true
+  launchctl kickstart -k "gui/$uid/$REMOTE_FORWARD_LABEL" >/dev/null 2>&1 || true
+  sleep 2
+
+  if ! launchctl print "gui/$uid/$REMOTE_FORWARD_LABEL" >/dev/null 2>&1; then
+    printf 'ERROR: remote forward LaunchAgent is not loaded: %s\n' "$REMOTE_FORWARD_LABEL" >&2
+    tail -80 /tmp/codex-gcp-forward.stderr 2>/dev/null >&2 || true
+    exit 1
+  fi
 }
 
 stop_local_launchd_if_present() {
@@ -804,6 +842,7 @@ force_reset_local_proxy() {
 
 stop_gcp_egress() {
   section "Stop local GCP egress data plane"
+  reset_remote_forward_controlmasters
   kill_listeners "$LOCAL_HTTP_PORT"
   kill_listeners "$LOCAL_SOCKS_PORT"
   rm -f "$STATE_DIR/gcp-socks.manual.pid" "$STATE_DIR/privoxy.manual.pid" 2>/dev/null || true
@@ -872,39 +911,8 @@ limit_egress() {
 force_reset_remote_proxy() {
   section "Force reset remote 10800 and SSH ControlMasters"
   reset_remote_forward_controlmasters
-  ssh_remote "REMOTE_HTTP_PORT='$REMOTE_HTTP_PORT' REMOTE_CONTROL_MIN_AGE='$STALE_REMOTE_SSHD_MIN_AGE' bash -s" <<'REMOTE' || true
-set -Eeuo pipefail
-
-remote_user="$(id -un 2>/dev/null || true)"
-self=$$
-keep=" $self "
-pid="$self"
-while :; do
-  pid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')"
-  [ -n "$pid" ] || break
-  keep="${keep}${pid} "
-  [ "$pid" = "1" ] && break
-done
-
-victims="$(ps -eo pid=,etimes=,args= 2>/dev/null | awk -v keep="$keep" -v min_age="$REMOTE_CONTROL_MIN_AGE" -v remote_user="$remote_user" '
-  $0 ~ "sshd: " remote_user "@notty" {
-    pid=$1
-    age=$2
-    if (age >= min_age && index(keep, " " pid " ") == 0) {
-      print pid
-    }
-  }
-')"
-
-if [ -n "$victims" ]; then
-  echo "killing remote non-tty ssh sessions: $(echo "$victims" | tr '\n' ' ')"
-  kill $victims 2>/dev/null || true
-  sleep 1
-  kill -9 $victims 2>/dev/null || true
-fi
-
-ss -ltn 2>/dev/null | egrep ":${REMOTE_HTTP_PORT}|:10801|:18080|:18081" || true
-REMOTE
+  clear_stale_remote_forward_sessions
+  ssh_remote "ss -ltn 2>/dev/null | egrep ':${REMOTE_HTTP_PORT}|:10801|:18080|:18081' || true"
 }
 
 restart_remote_codex_app_server() {
@@ -958,20 +966,8 @@ start_remote_forward() {
   rm -f "$STATE_DIR/remote-forward.manual.log"
   clear_stale_remote_forward_sessions
 
-  # The company workspace SSH path drops bare `ssh -fN/-fMN` tunnel masters with
-  # "client_loop: send disconnect: Broken pipe". Prefer the shared ControlMaster
-  # that Codex App / normal SSH sessions already keep alive.
-  local configured_control_path
-  configured_control_path="$(configured_remote_control_path)"
-
-  if [[ -n "$configured_control_path" && "$configured_control_path" != "none" && -S "$configured_control_path" ]]; then
-    printf 'using existing SSH ControlMaster: %s\n' "$configured_control_path"
-    request_remote_forward_on_controlmaster "$configured_control_path"
-  else
-    printf 'no existing SSH ControlMaster found; creating one for remote forward\n'
-    ensure_remote_controlmaster "$configured_control_path"
-    request_remote_forward_on_controlmaster "$configured_control_path"
-  fi
+  printf 'starting launchd-managed remote forward: %s\n' "$REMOTE_FORWARD_LABEL"
+  start_dedicated_remote_forward
   sleep 2
 
   proxy_ip="$(probe_remote_forward "$REMOTE_FORWARD_VERIFY_ATTEMPTS" "$REMOTE_FORWARD_VERIFY_DELAY" || true)"
@@ -979,9 +975,7 @@ start_remote_forward() {
     printf 'remote forward data plane unhealthy; resetting SSH ControlMaster and retrying\n'
     reset_remote_forward_controlmasters
     clear_stale_remote_forward_sessions
-    configured_control_path="$(configured_remote_control_path)"
-    ensure_remote_controlmaster "$configured_control_path"
-    request_remote_forward_on_controlmaster "$configured_control_path"
+    start_dedicated_remote_forward
     proxy_ip="$(probe_remote_forward "$REMOTE_FORWARD_VERIFY_ATTEMPTS" "$REMOTE_FORWARD_VERIFY_DELAY" || true)"
   fi
 

@@ -41,6 +41,8 @@ KINIT_RENEWABLE_LIFE="${KINIT_RENEWABLE_LIFE:-7d}"
 JUMP_PROXY_SERVICE="${JUMP_PROXY_SERVICE:-host/jump-proxy.example.com@REALM.EXAMPLE}"
 SSH_PROBE_TARGET="${SSH_PROBE_TARGET:-remote-workspace}"
 CODEX_REFRESH_SCRIPT="${CODEX_REFRESH_SCRIPT:-$LOCAL_HOME/bin/codex-gcp-remote}"
+STATE_DIR="${STATE_DIR:-$LOCAL_HOME/.codex-gcp-tunnel}"
+GCP_ENABLED_FILE="${GCP_ENABLED_FILE:-$STATE_DIR/gcp.enabled}"
 
 log() {
     local ts
@@ -459,6 +461,15 @@ stop_codex_gcp_egress() {
     run_with_timeout "$CODEX_TIMEOUT_SECONDS" "$CODEX_REFRESH_SCRIPT" limit-egress
 }
 
+mark_gcp_enabled() {
+    mkdir -p "$STATE_DIR"
+    date '+%Y-%m-%d %H:%M:%S' > "$GCP_ENABLED_FILE"
+}
+
+mark_gcp_disabled() {
+    rm -f "$GCP_ENABLED_FILE" 2>/dev/null || true
+}
+
 case "${1:-}" in
     status)
         klist 2>&1
@@ -524,6 +535,7 @@ if [ "$MODE" = "stop-gcp" ]; then
     stop_codex_gcp_egress
     RC=$?
     if [ "$RC" -eq 0 ]; then
+        mark_gcp_disabled
         log "成功, Codex Remote GCP 出口已停止, stale worker 已清理"
         write_status "stopped" "ok" "stopped" "stopped" "$EXP" "GCP出口已停止；本地1080/7890关闭，远端stale codex exec已清理"
         [ -t 1 ] && echo "GCP 出口已停止"
@@ -617,6 +629,7 @@ if [ "$MODE" = "remote-gcp" ] || [ "$MODE" = "remote-gcp-full" ]; then
     fi
     RC=$?
     if [ "$RC" -eq 0 ]; then
+        mark_gcp_enabled
         log "成功, Codex Remote GCP ${MODE} repair+verify 均可用"
         write_status "ok" "ok" "ok" "ok" "$EXP" "Codex Remote GCP ${MODE} 成功"
         [ -t 1 ] && echo "Remote GCP 刷新成功"

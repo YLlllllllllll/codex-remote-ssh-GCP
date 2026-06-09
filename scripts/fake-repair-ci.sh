@@ -24,10 +24,11 @@ reject_pattern() {
 }
 
 printf '== static syntax ==\n'
-bash -n bin/kinit-refresh bin/codex-gcp-remote bin/codex-gcp-monitor bin/codex-workspace-proxy bin/stay-awake.sh scripts/install.sh scripts/fake-repair-ci.sh scripts/live-egress-ci.sh
+bash -n bin/kinit-refresh bin/codex-gcp-remote bin/codex-gcp-forward-session bin/codex-gcp-monitor bin/codex-gcp-autoheal bin/codex-workspace-proxy bin/stay-awake.sh scripts/install.sh scripts/fake-repair-ci.sh scripts/live-egress-ci.sh
 bin/codex-gcp-monitor self-test
+bin/codex-gcp-autoheal self-test
 swiftc -parse app/kinit-refresh-status.swift
-plutil -lint launchd/com.example.kinit-refresh.plist launchd/com.example.kinit-refresh-status.plist launchd/com.example.stay-awake.plist launchd/com.example.codex-gcp-monitor.plist >/dev/null
+plutil -lint launchd/com.example.kinit-refresh.plist launchd/com.example.kinit-refresh-status.plist launchd/com.example.stay-awake.plist launchd/com.example.codex-gcp-forward.plist launchd/com.example.codex-gcp-monitor.plist launchd/com.example.codex-gcp-autoheal.plist >/dev/null
 python3 -m py_compile tools/codex-http-to-socks.py
 reject_pattern '<string>@/bin/' launchd/com.example.kinit-refresh-status.plist
 need_pattern 'com.example.kinit-refresh.plist' scripts/install.sh
@@ -65,6 +66,8 @@ need_pattern 'KINIT_RENEWABLE_LIFE' bin/kinit-refresh
 need_pattern 'run_single_kinit_with_timeout' bin/kinit-refresh
 need_pattern 'stop-gcp\|stop-egress\|limit-gcp\|limit-egress' bin/kinit-refresh
 need_pattern 'stop_codex_gcp_egress' bin/kinit-refresh
+need_pattern 'mark_gcp_enabled' bin/kinit-refresh
+need_pattern 'mark_gcp_disabled' bin/kinit-refresh
 need_pattern 'verify_codex_chain_clean_fast' bin/kinit-refresh
 need_pattern 'clean-repair-fast' bin/codex-gcp-remote
 need_pattern 'stop-egress' bin/codex-gcp-remote
@@ -78,6 +81,15 @@ need_pattern 'STALE_CODEX_EXEC_MIN_AGE' bin/codex-gcp-remote
 need_pattern 'CODEX_EXEC_CLEAN_MARKER' bin/codex-gcp-remote
 need_pattern 'restart_remote_codex_app_server' bin/codex-gcp-remote
 need_pattern 'start_remote_forward' bin/codex-gcp-remote
+need_pattern 'REMOTE_FORWARD_PID_FILE' bin/codex-gcp-remote
+need_pattern 'REMOTE_FORWARD_LABEL' bin/codex-gcp-remote
+need_pattern 'codex-gcp-forward-session' scripts/install.sh
+need_pattern 'com.example.codex-gcp-forward.plist' scripts/install.sh
+need_pattern 'KeepAlive' launchd/com.example.codex-gcp-forward.plist
+need_pattern 'ControlMaster=no' bin/codex-gcp-forward-session
+need_pattern 'start_dedicated_remote_forward' bin/codex-gcp-remote
+need_pattern 'stop_dedicated_remote_forward' bin/codex-gcp-remote
+need_pattern 'launchctl bootstrap' bin/codex-gcp-remote
 
 printf '== live CI contract ==\n'
 need_pattern 'scripts/fake-repair-ci.sh' scripts/live-egress-ci.sh
@@ -102,6 +114,23 @@ need_pattern 'REMOTE_CODEX_EXEC_COUNT' bin/codex-gcp-monitor
 need_pattern 'REMOTE_10800_SOCKET_COUNT' bin/codex-gcp-monitor
 need_pattern 'StartInterval' launchd/com.example.codex-gcp-monitor.plist
 reject_pattern 'kinit-refresh remote-gcp|clean-repair-fast|killall|pkill|launchctl setenv|/Applications/Codex.app' bin/codex-gcp-monitor
+
+printf '== autoheal contract ==\n'
+need_pattern 'codex-gcp-autoheal \[run\|status\|self-test\]' bin/codex-gcp-autoheal
+need_pattern 'CODEX_GCP_AUTOHEAL_ENABLED' bin/codex-gcp-autoheal
+need_pattern 'AUTOHEAL_MIN_CONSECUTIVE_FAILS' bin/codex-gcp-autoheal
+need_pattern 'AUTOHEAL_COOLDOWN_SECONDS' bin/codex-gcp-autoheal
+need_pattern 'GCP_ENABLED_FILE' bin/codex-gcp-autoheal
+need_pattern 'gcp_intended_on' bin/codex-gcp-autoheal
+need_pattern 'sync_enabled_marker_if_healthy' bin/codex-gcp-autoheal
+need_pattern 'cause_autohealable' bin/codex-gcp-autoheal
+need_pattern 'consecutive_fail_count' bin/codex-gcp-autoheal
+need_pattern 'kinit-refresh' bin/codex-gcp-autoheal
+need_pattern 'codex-gcp-autoheal' scripts/install.sh
+need_pattern 'com.example.codex-gcp-autoheal.plist' scripts/install.sh
+need_pattern 'StartInterval' launchd/com.example.codex-gcp-autoheal.plist
+need_pattern 'CODEX_GCP_AUTOHEAL_ENABLED' config.env.example
+reject_pattern 'killall|pkill|launchctl setenv|/Applications/Codex.app' bin/codex-gcp-autoheal
 
 printf '== clean repair ordering ==\n'
 python3 - <<'PY'

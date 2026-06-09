@@ -22,6 +22,8 @@ The menu-bar app reads `/tmp/kinit-refresh.status` and exposes:
 
 `修复 GCP` automatically cleans stale remote sessions and processes before rebuilding the proxy path. It removes stale `codex exec` workers older than `STALE_CODEX_EXEC_MIN_AGE`, stale SSH tunnel sessions, and stale app-server/proxy state. It does not blindly kill every Codex process, so fresh real work is not treated as disposable.
 
+When `修复 GCP` succeeds it writes `~/.codex-gcp-tunnel/gcp.enabled`. `stop-gcp` removes that marker. The auto-heal LaunchAgent uses this marker plus the live listener state to decide whether GCP was meant to be on, so it can repair a broken open path without reopening GCP after you intentionally stopped it.
+
 The menu also shows `Codex Sessions: N`. Expand that item to compare the monitor's remote `codex exec` workers against the work you expect to be running. The submenu lists PID, parent PID, age, CPU, memory, and command summary, with buttons to open or copy the latest detail log.
 
 The `修复 GCP` menu title also shows read-only GCP traffic counters from the passive monitor:
@@ -58,6 +60,7 @@ kinit-refresh ssh-only
 kinit-refresh remote-gcp
 kinit-refresh stop-gcp
 kinit-refresh log
+codex-gcp-autoheal status
 codex-gcp-remote diagnose
 codex-gcp-remote limit-egress
 codex-gcp-remote clean-workers
@@ -96,7 +99,33 @@ Logs are stored under `~/.codex-gcp-tunnel/`:
 monitor.jsonl
 monitor-latest.env
 active-sessions.txt
+autoheal.log
 ```
+
+## Auto-Heal
+
+`codex-gcp-autoheal` is installed as a separate LaunchAgent and runs every 60 seconds. It is intentionally separate from the passive monitor.
+
+It runs `kinit-refresh remote-gcp` only when all of these are true:
+
+- auto-heal is enabled with `CODEX_GCP_AUTOHEAL_ENABLED=1`
+- the latest monitor sample is fresh
+- GCP was already intended to be on, either by `gcp.enabled` or existing `1080/7890/10800` listeners
+- the monitor has at least `AUTOHEAL_MIN_CONSECUTIVE_FAILS` consecutive failures
+- the latest failure cause is a repairable data-plane cause, such as `local_7890_bad_egress`, `remote_10800_bad_egress`, or `chatgpt_unreachable_*`
+- the cooldown window has passed
+
+Defaults:
+
+```bash
+CODEX_GCP_AUTOHEAL_ENABLED=1
+AUTOHEAL_MIN_CONSECUTIVE_FAILS=3
+AUTOHEAL_COOLDOWN_SECONDS=900
+AUTOHEAL_MAX_SAMPLE_AGE_SECONDS=300
+AUTOHEAL_REPAIR_MODE=remote-gcp
+```
+
+Disable it locally by setting `CODEX_GCP_AUTOHEAL_ENABLED=0` in `~/.config/codex-gcp-refresh/config.env`.
 
 ## Non-Disruptive CI
 

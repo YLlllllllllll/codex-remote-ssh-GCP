@@ -1,0 +1,327 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+LOCAL_USER="$(id -un)"
+LOCAL_HOME="${LOCAL_HOME:-$(dscl . -read "/Users/${LOCAL_USER}" NFSHomeDirectory 2>/dev/null | awk '{ print $2; exit }')}"
+LOCAL_HOME="${LOCAL_HOME:-$HOME}"
+export HOME="$LOCAL_HOME"
+
+CONFIG_FILE="${CODEX_GCP_REFRESH_CONFIG:-$LOCAL_HOME/.config/codex-gcp-refresh/config.env}"
+if [[ -f "$CONFIG_FILE" ]]; then
+  # shellcheck disable=SC1090
+  . "$CONFIG_FILE"
+fi
+
+STATE_DIR="${STATE_DIR:-$LOCAL_HOME/.codex-gcp-tunnel}"
+LATEST_FILE="${MONITOR_LATEST_FILE:-$STATE_DIR/monitor-latest.env}"
+MONITOR_LOG_FILE="${MONITOR_LOG_FILE:-$STATE_DIR/monitor.jsonl}"
+AUTOHEAL_LOG_FILE="${AUTOHEAL_LOG_FILE:-$STATE_DIR/autoheal.log}"
+AUTOHEAL_LAST_FILE="${AUTOHEAL_LAST_FILE:-$STATE_DIR/autoheal.last}"
+GCP_ENABLED_FILE="${GCP_ENABLED_FILE:-$STATE_DIR/gcp.enabled}"
+KINIT_SCRIPT="${KINIT_SCRIPT:-$LOCAL_HOME/bin/kinit-refresh}"
+MONITOR_SCRIPT="${MONITOR_SCRIPT:-$LOCAL_HOME/bin/codex-gcp-monitor}"
+AUTOHEAL_LOCK_DIR="${AUTOHEAL_LOCK_DIR:-$STATE_DIR/autoheal.lock}"
+
+CODEX_GCP_AUTOHEAL_ENABLED="${CODEX_GCP_AUTOHEAL_ENABLED:-1}"
+AUTOHEAL_MIN_CONSECUTIVE_FAILS="${AUTOHEAL_MIN_CONSECUTIVE_FAILS:-3}"
+AUTOHEAL_COOLDOWN_SECONDS="${AUTOHEAL_COOLDOWN_SECONDS:-900}"
+AUTOHEAL_MAX_SAMPLE_AGE_SECONDS="${AUTOHEAL_MAX_SAMPLE_AGE_SECONDS:-300}"
+AUTOHEAL_REPAIR_MODE="${AUTOHEAL_REPAIR_MODE:-remote-gcp}"
+
+log() {
+  mkdir -p "$STATE_DIR"
+  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$AUTOHEAL_LOG_FILE"
+}
+
+kv_value() {
+  local key="$1"
+  awk -v key="$key" '
+    index($0, key "=") == 1 {
+      sub(/^[^=]*=/, "")
+      print
+      exit
+    }
+  ' "$LATEST_FILE" 2>/dev/null || true
+}
+
+number_or_zero() {
+  case "${1:-}" in
+    ''|*[!0-9]*) printf '0\n' ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+
+file_mtime() {
+  stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || printf '0\n'
+}
+
+latest_sample_fresh() {
+  local mtime now age
+  [[ -f "$LATEST_FILE" ]] || return 1
+  mtime="$(file_mtime "$LATEST_FILE")"
+  now="$(date +%s)"
+  age=$((now - mtime))
+  [[ "$age" -le "$AUTOHEAL_MAX_SAMPLE_AGE_SECONDS" ]]
+}
+
+gcp_intended_on() {
+  local socks_count http_count remote_count
+  [[ -f "$GCP_ENABLED_FILE" ]] && return 0
+
+  socks_count="$(number_or_zero "$(kv_value LOCAL_1080_COUNT)")"
+  http_count="$(number_or_zero "$(kv_value LOCAL_7890_COUNT)")"
+  remote_count="$(number_or_zero "$(kv_value REMOTE_10800_COUNT)")"
+  [[ "$socks_count" -gt 0 || "$http_count" -gt 0 || "$remote_count" -gt 0 ]]
+}
+
+cause_autohealable() {
+  case "${1:-}" in
+    local_1080_missing|local_7890_missing|local_7890_bad_egress|remote_10800_missing|remote_10800_bad_egress|chatgpt_unreachable_*)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+sync_enabled_marker_if_healthy() {
+  local status
+  [[ -f "$LATEST_FILE" ]] || return 0
+  status="$(kv_value STATUS)"
+  if [[ "$status" == "ok" ]] && gcp_intended_on; then
+    mkdir -p "$STATE_DIR"
+    if [[ ! -f "$GCP_ENABLED_FILE" ]]; then
+      date '+%Y-%m-%d %H:%M:%S' > "$GCP_ENABLED_FILE"
+      log "synced enabled marker from healthy monitor sample"
+    fi
+  fi
+}
+
+consecutive_fail_count() {
+  [[ -f "$MONITOR_LOG_FILE" ]] || {
+    printf '0\n'
+    return
+  }
+
+  tail -n 50 "$MONITOR_LOG_FILE" 2>/dev/null | awk '
+    function value(line, key, start, rest, out) {
+      start = index(line, "\"" key "\":")
+      if (!start) {
+        return ""
+      }
+      rest = substr(line, start + length(key) + 3)
+      out = rest
+      sub(/[,}].*/, "", out)
+      gsub(/^"|"$/, "", out)
+      return out
+    }
+    {
+      status = value($0, "status")
+      if (status != "") {
+        n++
+        statuses[n] = status
+      }
+    }
+    END {
+      count = 0
+      for (i = n; i >= 1; i--) {
+        if (statuses[i] == "fail") {
+          count++
+        } else {
+          break
+        }
+      }
+      print count
+    }
+  '
+}
+
+cooldown_remaining() {
+  local last now elapsed
+  [[ -f "$AUTOHEAL_LAST_FILE" ]] || {
+    printf '0\n'
+    return
+  }
+  last="$(head -n 1 "$AUTOHEAL_LAST_FILE" 2>/dev/null || printf '0')"
+  last="$(number_or_zero "$last")"
+  now="$(date +%s)"
+  elapsed=$((now - last))
+  if [[ "$elapsed" -ge "$AUTOHEAL_COOLDOWN_SECONDS" ]]; then
+    printf '0\n'
+  else
+    printf '%s\n' "$((AUTOHEAL_COOLDOWN_SECONDS - elapsed))"
+  fi
+}
+
+should_autoheal() {
+  local status cause fails remaining
+
+  [[ "$CODEX_GCP_AUTOHEAL_ENABLED" == "1" ]] || {
+    printf 'skip: autoheal disabled\n'
+    return 1
+  }
+  [[ -f "$LATEST_FILE" ]] || {
+    printf 'skip: no monitor sample\n'
+    return 1
+  }
+  latest_sample_fresh || {
+    printf 'skip: monitor sample stale\n'
+    return 1
+  }
+
+  status="$(kv_value STATUS)"
+  cause="$(kv_value CAUSE)"
+  [[ "$status" == "fail" ]] || {
+    printf 'skip: monitor status %s\n' "${status:-unknown}"
+    return 1
+  }
+  gcp_intended_on || {
+    printf 'skip: GCP not intended on\n'
+    return 1
+  }
+  cause_autohealable "$cause" || {
+    printf 'skip: cause not autohealable: %s\n' "${cause:-unknown}"
+    return 1
+  }
+
+  fails="$(number_or_zero "$(consecutive_fail_count)")"
+  if [[ "$fails" -lt "$AUTOHEAL_MIN_CONSECUTIVE_FAILS" ]]; then
+    printf 'skip: only %s consecutive failures, need %s\n' "$fails" "$AUTOHEAL_MIN_CONSECUTIVE_FAILS"
+    return 1
+  fi
+
+  remaining="$(number_or_zero "$(cooldown_remaining)")"
+  if [[ "$remaining" -gt 0 ]]; then
+    printf 'skip: cooldown %ss remaining\n' "$remaining"
+    return 1
+  fi
+
+  printf 'heal: cause=%s consecutive_failures=%s\n' "$cause" "$fails"
+  return 0
+}
+
+acquire_lock() {
+  mkdir -p "$STATE_DIR"
+  mkdir "$AUTOHEAL_LOCK_DIR" 2>/dev/null
+}
+
+release_lock() {
+  rmdir "$AUTOHEAL_LOCK_DIR" 2>/dev/null || true
+}
+
+run_once() {
+  local decision rc
+  sync_enabled_marker_if_healthy
+  decision="$(should_autoheal)" || {
+    log "$decision"
+    printf '%s\n' "$decision"
+    return 0
+  }
+
+  if ! acquire_lock; then
+    log "skip: autoheal already running"
+    printf 'skip: autoheal already running\n'
+    return 0
+  fi
+
+  printf '%s\n' "$(date +%s)" > "$AUTOHEAL_LAST_FILE"
+  log "start: $decision"
+  rc=0
+  if "$KINIT_SCRIPT" "$AUTOHEAL_REPAIR_MODE" >> "$AUTOHEAL_LOG_FILE" 2>&1; then
+    rc=0
+  else
+    rc=$?
+  fi
+  log "finish: rc=$rc mode=$AUTOHEAL_REPAIR_MODE"
+  "$MONITOR_SCRIPT" sample >/dev/null 2>> "$AUTOHEAL_LOG_FILE" || true
+  release_lock
+
+  printf 'autoheal ran: rc=%s\n' "$rc"
+  return "$rc"
+}
+
+status() {
+  printf 'enabled=%s\n' "$CODEX_GCP_AUTOHEAL_ENABLED"
+  printf 'min_consecutive_failures=%s\n' "$AUTOHEAL_MIN_CONSECUTIVE_FAILS"
+  printf 'cooldown_seconds=%s\n' "$AUTOHEAL_COOLDOWN_SECONDS"
+  printf 'latest_decision=%s\n' "$(should_autoheal 2>/dev/null || true)"
+  if [[ -f "$AUTOHEAL_LOG_FILE" ]]; then
+    tail -n 20 "$AUTOHEAL_LOG_FILE"
+  fi
+}
+
+self_test() {
+  local tmp decision count remaining
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+
+  STATE_DIR="$tmp"
+  LATEST_FILE="$tmp/monitor-latest.env"
+  MONITOR_LOG_FILE="$tmp/monitor.jsonl"
+  AUTOHEAL_LOG_FILE="$tmp/autoheal.log"
+  AUTOHEAL_LAST_FILE="$tmp/autoheal.last"
+  GCP_ENABLED_FILE="$tmp/gcp.enabled"
+  AUTOHEAL_LOCK_DIR="$tmp/autoheal.lock"
+  CODEX_GCP_AUTOHEAL_ENABLED=1
+  AUTOHEAL_MIN_CONSECUTIVE_FAILS=3
+  AUTOHEAL_COOLDOWN_SECONDS=900
+  AUTOHEAL_MAX_SAMPLE_AGE_SECONDS=300
+
+  mkdir -p "$tmp"
+  {
+    printf 'STATUS=fail\n'
+    printf 'CAUSE=local_7890_bad_egress\n'
+    printf 'LOCAL_1080_COUNT=1\n'
+    printf 'LOCAL_7890_COUNT=1\n'
+    printf 'REMOTE_10800_COUNT=1\n'
+  } > "$LATEST_FILE"
+  {
+    printf '{"status":"ok","cause":"ok"}\n'
+    printf '{"status":"fail","cause":"local_7890_bad_egress"}\n'
+    printf '{"status":"fail","cause":"local_7890_bad_egress"}\n'
+    printf '{"status":"fail","cause":"remote_10800_bad_egress"}\n'
+  } > "$MONITOR_LOG_FILE"
+
+  count="$(consecutive_fail_count)"
+  [[ "$count" == "3" ]] || {
+    printf 'autoheal self-test failed: count=%s\n' "$count" >&2
+    return 1
+  }
+  decision="$(should_autoheal)" || {
+    printf 'autoheal self-test failed: decision=%s\n' "$decision" >&2
+    return 1
+  }
+  case "$decision" in
+    heal:*) ;;
+    *)
+      printf 'autoheal self-test failed: unexpected decision=%s\n' "$decision" >&2
+      return 1
+      ;;
+  esac
+
+  printf '%s\n' "$(date +%s)" > "$AUTOHEAL_LAST_FILE"
+  remaining="$(cooldown_remaining)"
+  [[ "$remaining" -gt 0 ]] || {
+    printf 'autoheal self-test failed: cooldown=%s\n' "$remaining" >&2
+    return 1
+  }
+
+  printf 'codex-gcp-autoheal self-test: ok\n'
+}
+
+case "${1:-run}" in
+  run|run-once|sample)
+    run_once
+    ;;
+  status)
+    status
+    ;;
+  self-test)
+    self_test
+    ;;
+  *)
+    echo "Usage: codex-gcp-autoheal [run|status|self-test]" >&2
+    exit 2
+    ;;
+esac

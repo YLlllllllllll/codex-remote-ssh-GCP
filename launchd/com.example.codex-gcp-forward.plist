@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.example.codex-gcp-forward</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>@HOME@/bin/codex-gcp-forward-session</string>
+    </array>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/codex-gcp-forward.stdout</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/codex-gcp-forward.stderr</string>
+</dict>
+</plist>

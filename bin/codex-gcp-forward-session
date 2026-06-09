@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+LOCAL_USER="$(id -un)"
+LOCAL_HOME="${LOCAL_HOME:-$(dscl . -read "/Users/${LOCAL_USER}" NFSHomeDirectory 2>/dev/null | awk '{ print $2; exit }')}"
+LOCAL_HOME="${LOCAL_HOME:-$HOME}"
+export HOME="$LOCAL_HOME"
+
+CONFIG_FILE="${CODEX_GCP_REFRESH_CONFIG:-$LOCAL_HOME/.config/codex-gcp-refresh/config.env}"
+if [[ -f "$CONFIG_FILE" ]]; then
+  # shellcheck disable=SC1090
+  . "$CONFIG_FILE"
+fi
+
+REMOTE_HOST="${REMOTE_HOST:-${SSH_PROBE_TARGET:-remote-workspace}}"
+LOCAL_HTTP_HOST="${LOCAL_HTTP_HOST:-127.0.0.1}"
+LOCAL_HTTP_PORT="${LOCAL_HTTP_PORT:-7890}"
+REMOTE_HTTP_HOST="${REMOTE_HTTP_HOST:-127.0.0.1}"
+REMOTE_HTTP_PORT="${REMOTE_HTTP_PORT:-10800}"
+STATE_DIR="${STATE_DIR:-$LOCAL_HOME/.codex-gcp-tunnel}"
+REMOTE_FORWARD_PID_FILE="${REMOTE_FORWARD_PID_FILE:-$STATE_DIR/remote-forward.manual.pid}"
+
+mkdir -p "$STATE_DIR"
+printf '%s\n' "$$" > "$REMOTE_FORWARD_PID_FILE"
+
+exec ssh \
+  -T \
+  -o ControlMaster=no \
+  -o ControlPath=none \
+  -o BatchMode=yes \
+  -o ConnectTimeout=10 \
+  -o ConnectionAttempts=1 \
+  -o ServerAliveInterval=15 \
+  -o ServerAliveCountMax=12 \
+  -o ExitOnForwardFailure=yes \
+  -R "${REMOTE_HTTP_HOST}:${REMOTE_HTTP_PORT}:${LOCAL_HTTP_HOST}:${LOCAL_HTTP_PORT}" \
+  "$REMOTE_HOST" \
+  "while :; do sleep 3600; done"
