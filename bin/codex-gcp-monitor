@@ -18,6 +18,9 @@ GCP_PORT="${GCP_PORT:-443}"
 GCP_KEY="${GCP_KEY:-$LOCAL_HOME/.ssh/google_compute_engine}"
 GCP_EXPECTED_IP="${GCP_EXPECTED_IP:-203.0.113.10}"
 GCP_TRAFFIC_IFACE="${GCP_TRAFFIC_IFACE:-ens4}"
+GCP_SSH_KEX_ALGORITHMS="${GCP_SSH_KEX_ALGORITHMS:-curve25519-sha256}"
+GCP_SSH_HOST_KEY_ALGORITHMS="${GCP_SSH_HOST_KEY_ALGORITHMS:-ssh-ed25519}"
+GCP_SSH_CIPHERS="${GCP_SSH_CIPHERS:-chacha20-poly1305@openssh.com}"
 TRAFFIC_24H_WARN_BYTES="${TRAFFIC_24H_WARN_BYTES:-1073741824}"
 TRAFFIC_24H_CRITICAL_BYTES="${TRAFFIC_24H_CRITICAL_BYTES:-3221225472}"
 REMOTE_HOST="${REMOTE_HOST:-${SSH_PROBE_TARGET:-remote-workspace}}"
@@ -80,9 +83,15 @@ tcp_check() {
 }
 
 gcp_counter_probe() {
+  local -a extra_opts=()
+  [[ -n "$GCP_SSH_KEX_ALGORITHMS" ]] && extra_opts+=(-o "KexAlgorithms=$GCP_SSH_KEX_ALGORITHMS")
+  [[ -n "$GCP_SSH_HOST_KEY_ALGORITHMS" ]] && extra_opts+=(-o "HostKeyAlgorithms=$GCP_SSH_HOST_KEY_ALGORITHMS")
+  [[ -n "$GCP_SSH_CIPHERS" ]] && extra_opts+=(-o "Ciphers=$GCP_SSH_CIPHERS")
+
   ssh \
     -i "$GCP_KEY" \
     -o IdentitiesOnly=yes \
+    "${extra_opts[@]}" \
     -p "$GCP_PORT" \
     -o BatchMode=yes \
     -o ConnectTimeout="$MONITOR_CONNECT_TIMEOUT" \

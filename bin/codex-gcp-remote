@@ -79,7 +79,10 @@ IP_CHECK_TIMEOUT="${IP_CHECK_TIMEOUT:-15}"
 IP_CHECK_URL="${IP_CHECK_URL:-https://api.ipify.org}"
 CHATGPT_CODEX_URL="${CHATGPT_CODEX_URL:-https://chatgpt.com/backend-api/codex/responses}"
 SKIP_REMOTE_PLAIN_CHECK="${SKIP_REMOTE_PLAIN_CHECK:-0}"
-SSH_CONNECT_TIMEOUT="${SSH_CONNECT_TIMEOUT:-8}"
+SSH_CONNECT_TIMEOUT="${SSH_CONNECT_TIMEOUT:-20}"
+GCP_SSH_KEX_ALGORITHMS="${GCP_SSH_KEX_ALGORITHMS:-curve25519-sha256}"
+GCP_SSH_HOST_KEY_ALGORITHMS="${GCP_SSH_HOST_KEY_ALGORITHMS:-ssh-ed25519}"
+GCP_SSH_CIPHERS="${GCP_SSH_CIPHERS:-chacha20-poly1305@openssh.com}"
 REMOTE_FORWARD_VERIFY_ATTEMPTS="${REMOTE_FORWARD_VERIFY_ATTEMPTS:-8}"
 REMOTE_FORWARD_VERIFY_DELAY="${REMOTE_FORWARD_VERIFY_DELAY:-2}"
 VERIFY_FAST_ATTEMPTS="${VERIFY_FAST_ATTEMPTS:-6}"
@@ -285,12 +288,18 @@ ssh_remote_quiet() {
 }
 
 ssh_gcp() {
+  local -a extra_opts=()
+  [[ -n "$GCP_SSH_KEX_ALGORITHMS" ]] && extra_opts+=(-o "KexAlgorithms=$GCP_SSH_KEX_ALGORITHMS")
+  [[ -n "$GCP_SSH_HOST_KEY_ALGORITHMS" ]] && extra_opts+=(-o "HostKeyAlgorithms=$GCP_SSH_HOST_KEY_ALGORITHMS")
+  [[ -n "$GCP_SSH_CIPHERS" ]] && extra_opts+=(-o "Ciphers=$GCP_SSH_CIPHERS")
+
   ssh \
     -i "$GCP_KEY" \
     -o IdentitiesOnly=yes \
+    "${extra_opts[@]}" \
     -p "$GCP_PORT" \
     -o BatchMode=yes \
-    -o ConnectTimeout=10 \
+    -o ConnectTimeout="$SSH_CONNECT_TIMEOUT" \
     -o ConnectionAttempts=1 \
     "${GCP_USER}@${GCP_HOST}" "$@"
 }
@@ -484,10 +493,16 @@ start_local_socks() {
 
   kill_listeners "$LOCAL_SOCKS_PORT"
 
+  local -a extra_opts=()
+  [[ -n "$GCP_SSH_KEX_ALGORITHMS" ]] && extra_opts+=(-o "KexAlgorithms=$GCP_SSH_KEX_ALGORITHMS")
+  [[ -n "$GCP_SSH_HOST_KEY_ALGORITHMS" ]] && extra_opts+=(-o "HostKeyAlgorithms=$GCP_SSH_HOST_KEY_ALGORITHMS")
+  [[ -n "$GCP_SSH_CIPHERS" ]] && extra_opts+=(-o "Ciphers=$GCP_SSH_CIPHERS")
+
   ssh -fN \
     -E "$STATE_DIR/gcp-socks.manual.log" \
     -i "$GCP_KEY" \
     -o IdentitiesOnly=yes \
+    "${extra_opts[@]}" \
     -D "${LOCAL_SOCKS_HOST}:${LOCAL_SOCKS_PORT}" \
     -p "$GCP_PORT" \
     -o ConnectTimeout="$SSH_CONNECT_TIMEOUT" \

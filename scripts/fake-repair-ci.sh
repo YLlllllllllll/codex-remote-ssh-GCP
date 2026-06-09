@@ -79,6 +79,9 @@ need_pattern 'force_reset_remote_proxy' bin/codex-gcp-remote
 need_pattern 'clean_stale_remote_codex_exec' bin/codex-gcp-remote
 need_pattern 'STALE_CODEX_EXEC_MIN_AGE' bin/codex-gcp-remote
 need_pattern 'CODEX_EXEC_CLEAN_MARKER' bin/codex-gcp-remote
+need_pattern 'GCP_SSH_KEX_ALGORITHMS' bin/codex-gcp-remote
+need_pattern 'GCP_SSH_HOST_KEY_ALGORITHMS' bin/codex-gcp-remote
+need_pattern 'GCP_SSH_CIPHERS' bin/codex-gcp-remote
 need_pattern 'restart_remote_codex_app_server' bin/codex-gcp-remote
 need_pattern 'start_remote_forward' bin/codex-gcp-remote
 need_pattern 'REMOTE_FORWARD_PID_FILE' bin/codex-gcp-remote
@@ -106,6 +109,7 @@ need_pattern 'monitor.jsonl' bin/codex-gcp-monitor
 need_pattern 'monitor-latest.env' bin/codex-gcp-monitor
 need_pattern 'gcp_counter_ok' bin/codex-gcp-monitor
 need_pattern 'GCP_RX_BYTES' bin/codex-gcp-monitor
+need_pattern 'GCP_SSH_KEX_ALGORITHMS' bin/codex-gcp-monitor
 need_pattern 'TRAFFIC_TODAY_BYTES' bin/codex-gcp-monitor
 need_pattern 'TRAFFIC_24H_BYTES' bin/codex-gcp-monitor
 need_pattern 'TRAFFIC_STATUS' bin/codex-gcp-monitor
@@ -130,6 +134,7 @@ need_pattern 'codex-gcp-autoheal' scripts/install.sh
 need_pattern 'com.example.codex-gcp-autoheal.plist' scripts/install.sh
 need_pattern 'StartInterval' launchd/com.example.codex-gcp-autoheal.plist
 need_pattern 'CODEX_GCP_AUTOHEAL_ENABLED' config.env.example
+need_pattern 'GCP_SSH_KEX_ALGORITHMS' config.env.example
 reject_pattern 'killall|pkill|launchctl setenv|/Applications/Codex.app' bin/codex-gcp-autoheal
 
 printf '== clean repair ordering ==\n'
