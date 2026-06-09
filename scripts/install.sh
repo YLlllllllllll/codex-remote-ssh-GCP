@@ -29,6 +29,9 @@ sed "s#@HOME@#$HOME_DIR#g" "$ROOT/launchd/com.example.kinit-refresh-status.plist
 sed "s#@HOME@#$HOME_DIR#g" "$ROOT/launchd/com.example.stay-awake.plist" > "$LAUNCH_DIR/com.example.stay-awake.plist"
 sed "s#@HOME@#$HOME_DIR#g" "$ROOT/launchd/com.example.codex-gcp-monitor.plist" > "$LAUNCH_DIR/com.example.codex-gcp-monitor.plist"
 
+launchctl bootout "gui/$(id -u)" "$LAUNCH_DIR/com.example.kinit-refresh.plist" 2>/dev/null || true
+launchctl bootstrap "gui/$(id -u)" "$LAUNCH_DIR/com.example.kinit-refresh.plist" 2>/dev/null || true
+launchctl kickstart -k "gui/$(id -u)/com.example.kinit-refresh" 2>/dev/null || true
 launchctl bootstrap "gui/$(id -u)" "$LAUNCH_DIR/com.example.kinit-refresh-status.plist" 2>/dev/null || true
 launchctl kickstart -k "gui/$(id -u)/com.example.kinit-refresh-status" 2>/dev/null || true
 launchctl bootout "gui/$(id -u)" "$LAUNCH_DIR/com.example.codex-gcp-monitor.plist" 2>/dev/null || true

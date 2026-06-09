@@ -30,6 +30,8 @@ swiftc -parse app/kinit-refresh-status.swift
 plutil -lint launchd/com.example.kinit-refresh.plist launchd/com.example.kinit-refresh-status.plist launchd/com.example.stay-awake.plist launchd/com.example.codex-gcp-monitor.plist >/dev/null
 python3 -m py_compile tools/codex-http-to-socks.py
 reject_pattern '<string>@/bin/' launchd/com.example.kinit-refresh-status.plist
+need_pattern 'com.example.kinit-refresh.plist' scripts/install.sh
+need_pattern 'com.example.kinit-refresh"' scripts/install.sh
 
 printf '== app menu contract ==\n'
 need_pattern 'title: "修复 GCP".*refreshRemoteGCP' app/kinit-refresh-status.swift
