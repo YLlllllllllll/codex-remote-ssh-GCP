@@ -16,6 +16,7 @@ remote Codex -> remote 127.0.0.1:10800 HTTP
 The menu-bar app reads `/tmp/kinit-refresh.status` and exposes:
 
 - `修复 GCP`: one-shot forced cleanup, rebuild, and validation for the remote Codex GCP path.
+- `登录/更新 kinit`: prompts once for the Kerberos password, saves it to macOS Keychain, then verifies SSH.
 - `刷新 SSH`: refresh/verify Kerberos and company SSH only.
 - `保持唤醒` / `关闭防休眠`: toggles the LaunchAgent-backed stay-awake helper.
 
@@ -41,7 +42,7 @@ The displayed total is RX+TX on the GCP VM interface. It is meant as an anomaly 
 scripts/install.sh
 ```
 
-4. Save the Kerberos password to Keychain if needed:
+4. Save the Kerberos password to Keychain if needed, either from the menu-bar app with `登录/更新 kinit`, or manually:
 
 ```bash
 kinit-refresh save-password

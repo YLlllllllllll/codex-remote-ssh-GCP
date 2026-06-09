@@ -18,6 +18,7 @@ final class StatusApp: NSObject, NSApplicationDelegate {
     private let refreshGCPItem = NSMenuItem(title: "修复 GCP", action: #selector(refreshRemoteGCP), keyEquivalent: "g")
     private let sessionsItem = NSMenuItem(title: "Codex Sessions: 采样中", action: nil, keyEquivalent: "")
     private let sessionsMenu = NSMenu(title: "Codex Sessions")
+    private let kinitLoginItem = NSMenuItem(title: "登录/更新 kinit", action: #selector(loginKinit), keyEquivalent: "k")
     private let toggleStayAwakeItem = NSMenuItem(title: "保持唤醒", action: #selector(toggleStayAwake), keyEquivalent: "a")
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -36,6 +37,7 @@ final class StatusApp: NSObject, NSApplicationDelegate {
         menu.addItem(refreshGCPItem)
         sessionsItem.submenu = sessionsMenu
         menu.addItem(sessionsItem)
+        menu.addItem(kinitLoginItem)
         menu.addItem(NSMenuItem(title: "刷新 SSH", action: #selector(refreshSSH), keyEquivalent: "r"))
         menu.addItem(toggleStayAwakeItem)
         statusItem.menu = menu
@@ -87,6 +89,7 @@ final class StatusApp: NSObject, NSApplicationDelegate {
         summaryItem.toolTip = "Proxy: \(proxy) | Codex: \(codex) | 更新: \(updated) | \(trafficLabel)"
         refreshGCPItem.title = "修复 GCP    \(trafficLabel)"
         refreshGCPItem.toolTip = trafficTooltip(traffic)
+        kinitLoginItem.toolTip = "输入一次 Kerberos 密码并保存到 macOS Keychain；之后刷新 SSH 会自动执行 kinit"
         updateSessionsMenu(traffic: traffic, sessions: sessions)
 
         let awakeRunning = isStayAwakeRunning()
@@ -212,6 +215,26 @@ final class StatusApp: NSObject, NSApplicationDelegate {
 
     @objc private func refreshRemoteGCP() {
         runRefresh(title: "🟡KC", arguments: ["remote-gcp"])
+    }
+
+    @objc private func loginKinit() {
+        statusItem.button?.title = "🟡KC"
+        DispatchQueue.global(qos: .utility).async {
+            let task = Process()
+            task.executableURL = URL(fileURLWithPath: self.refreshScript)
+            task.arguments = ["save-password"]
+            do {
+                try task.run()
+                task.waitUntilExit()
+                if task.terminationStatus == 0 {
+                    self.runProcess(self.refreshScript, ["ssh-only"])
+                }
+            } catch {
+            }
+            DispatchQueue.main.async {
+                self.updateStatus()
+            }
+        }
     }
 
     @objc private func openSessionsLog() {

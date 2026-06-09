@@ -34,6 +34,8 @@ reject_pattern '<string>@/bin/' launchd/com.example.kinit-refresh-status.plist
 printf '== app menu contract ==\n'
 need_pattern 'title: "修复 GCP".*refreshRemoteGCP' app/kinit-refresh-status.swift
 need_pattern 'title: "刷新 SSH".*refreshSSH' app/kinit-refresh-status.swift
+need_pattern 'title: "登录/更新 kinit".*loginKinit' app/kinit-refresh-status.swift
+need_pattern 'save-password' app/kinit-refresh-status.swift
 need_pattern 'trafficSummary' app/kinit-refresh-status.swift
 need_pattern 'TRAFFIC_TODAY_HUMAN' app/kinit-refresh-status.swift
 need_pattern 'TRAFFIC_24H_HUMAN' app/kinit-refresh-status.swift
