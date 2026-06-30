@@ -7,7 +7,7 @@
   <string>com.example.stay-awake</string>
   <key>ProgramArguments</key>
   <array>
-    <string>@/bin/stay-awake.sh</string>
+    <string>@HOME@/bin/stay-awake.sh</string>
     <string>forever</string>
   </array>
   <key>RunAtLoad</key>

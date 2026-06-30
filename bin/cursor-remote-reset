@@ -1,0 +1,200 @@
+#!/bin/bash
+set -euo pipefail
+
+LOCAL_USER="$(id -un)"
+LOCAL_HOME="$(dscl . -read "/Users/${LOCAL_USER}" NFSHomeDirectory 2>/dev/null | awk '{ print $2; exit }')"
+LOCAL_HOME="${LOCAL_HOME:-$HOME}"
+export HOME="$LOCAL_HOME"
+
+LOG_FILE="/tmp/cursor-remote-reset.log"
+KILL_GRACE_SECONDS="${CURSOR_REMOTE_RESET_KILL_GRACE_SECONDS:-3}"
+MIN_AGE="${CURSOR_REMOTE_RESET_MIN_AGE:-0}"
+DRY_RUN="${CURSOR_REMOTE_RESET_DRY_RUN:-0}"
+
+if [ "${1:-}" = "--dry-run" ]; then
+    DRY_RUN=1
+    shift
+fi
+
+case "${1:-}" in
+    ""|reset)
+        ;;
+    status)
+        DRY_RUN=1
+        ;;
+    *)
+        echo "Usage: cursor-remote-reset [--dry-run] [reset|status]" >&2
+        exit 2
+        ;;
+esac
+
+log() {
+    local ts
+    ts=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[${ts}] $*" >> "$LOG_FILE"
+    [ -t 1 ] && echo "[${ts}] $*"
+    return 0
+}
+
+process_age_seconds() {
+    local pid=$1
+    local value
+
+    value=$(ps -o etime= -p "$pid" 2>/dev/null | awk '{ print $1; exit }')
+    [ -n "$value" ] || return 1
+
+    awk -v value="$value" '
+        function age_seconds(value, parts, clock, n, days) {
+            days = 0
+            if (index(value, "-") > 0) {
+                split(value, parts, "-")
+                days = parts[1] + 0
+                value = parts[2]
+            }
+
+            n = split(value, clock, ":")
+            if (n == 3) {
+                return days * 86400 + clock[1] * 3600 + clock[2] * 60 + clock[3]
+            }
+            if (n == 2) {
+                return days * 86400 + clock[1] * 60 + clock[2]
+            }
+            return days * 86400 + value
+        }
+
+        BEGIN { print age_seconds(value) }
+    '
+}
+
+process_pgid() {
+    local pid=$1
+
+    ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' '
+}
+
+cursor_remote_ssh_groups() {
+    local min_age=$1
+    local self_pgid
+
+    self_pgid=$(process_pgid "$$")
+    ps -axo pid=,ppid=,pgid=,etime=,command= 2>/dev/null | awk -v min_age="$min_age" -v self_pgid="$self_pgid" '
+        function age_seconds(value, parts, clock, n, days) {
+            days = 0
+            if (index(value, "-") > 0) {
+                split(value, parts, "-")
+                days = parts[1] + 0
+                value = parts[2]
+            }
+
+            n = split(value, clock, ":")
+            if (n == 3) {
+                return days * 86400 + clock[1] * 3600 + clock[2] * 60 + clock[3]
+            }
+            if (n == 2) {
+                return days * 86400 + clock[1] * 60 + clock[2]
+            }
+            return days * 86400 + value
+        }
+
+        {
+            pid = $1
+            ppid = $2
+            pgid = $3
+            age = age_seconds($4)
+            line = $0
+            sub(/^[[:space:]]*[0-9]+[[:space:]]+[0-9]+[[:space:]]+[0-9]+[[:space:]]+[^[:space:]]+[[:space:]]+/, "", line)
+
+            if (pgid <= 1 || pgid == self_pgid || age < min_age) {
+                next
+            }
+
+            reason = ""
+            port = ""
+            if (match(line, /(^|[[:space:]\/])ssh -T -D [0-9][0-9]*/)) {
+                port = substr(line, RSTART, RLENGTH)
+                sub(/^.*-D /, "", port)
+            }
+
+            if (line ~ /cursor_remote_install_[^ ]*\.sh/ && line ~ /ssh -T -D/) {
+                reason = "cursor_remote_install"
+            } else if (line ~ /(^|\/)ssh -T -D [0-9][0-9]* [0-9a-f]/ && line ~ /bash --login -c bash/) {
+                reason = "cursor_remote_ssh"
+            }
+
+            if (reason != "" && !(pgid in seen)) {
+                seen[pgid] = 1
+                print pgid, age, pid, reason, port
+            }
+        }
+    '
+}
+
+cursor_remote_listener_groups() {
+    local ssh_groups=$1
+    local min_age=$2
+    local self_pgid
+
+    self_pgid=$(process_pgid "$$")
+    echo "$ssh_groups" | awk '$5 ~ /^[0-9][0-9]*$/ { print $5 }' | sort -u | while read -r port; do
+        [ -n "$port" ] || continue
+        lsof -nP -iTCP:"$port" -sTCP:LISTEN -Fp 2>/dev/null | sed -n 's/^p//p' | while read -r pid; do
+            local pgid
+            local age
+
+            [ -n "$pid" ] || continue
+            pgid=$(process_pgid "$pid")
+            [ -n "$pgid" ] || continue
+            if [ "$pgid" -le 1 ] || [ "$pgid" = "$self_pgid" ]; then
+                continue
+            fi
+
+            age=$(process_age_seconds "$pid" || true)
+            [ -n "$age" ] || continue
+            if [ "$age" -lt "$min_age" ]; then
+                continue
+            fi
+
+            echo "$pgid $age $pid cursor_remote_mux_listener:$port $port"
+        done
+    done
+}
+
+process_group_alive() {
+    local pgid=$1
+
+    ps -axo pgid= 2>/dev/null | awk -v pgid="$pgid" '$1 == pgid { found = 1 } END { exit found ? 0 : 1 }'
+}
+
+ssh_groups=$(cursor_remote_ssh_groups "$MIN_AGE")
+listener_groups=$(cursor_remote_listener_groups "$ssh_groups" "$MIN_AGE" || true)
+groups=$(printf '%s\n%s\n' "$ssh_groups" "$listener_groups" | awk 'NF && !seen[$1]++')
+if [ -z "$groups" ]; then
+    log "No Cursor Remote SSH process groups found (min_age=${MIN_AGE}s)"
+    [ "$DRY_RUN" = "1" ] && echo "DRY RUN: no Cursor Remote SSH process groups found"
+    exit 0
+fi
+
+if [ "$DRY_RUN" = "1" ]; then
+    echo "$groups" | while read -r pgid age pid reason port; do
+        [ -n "$pgid" ] || continue
+        echo "DRY RUN: would terminate Cursor Remote SSH process group -${pgid} (pid=${pid}, age=${age}s, reason=${reason})"
+    done
+    exit 0
+fi
+
+log "Resetting Cursor Remote SSH process groups (min_age=${MIN_AGE}s)"
+echo "$groups" | while read -r pgid age pid reason port; do
+    [ -n "$pgid" ] || continue
+    log "TERM Cursor Remote SSH process group -${pgid} (pid=${pid}, age=${age}s, reason=${reason})"
+    kill -TERM "-${pgid}" 2>/dev/null || true
+done
+
+sleep "$KILL_GRACE_SECONDS"
+
+echo "$groups" | while read -r pgid age pid reason port; do
+    [ -n "$pgid" ] || continue
+    if process_group_alive "$pgid"; then
+        log "KILL Cursor Remote SSH process group -${pgid} (pid=${pid}, age=${age}s, reason=${reason})"
+        kill -KILL "-${pgid}" 2>/dev/null || true
+    fi
+done

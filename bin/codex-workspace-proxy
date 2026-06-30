@@ -23,7 +23,7 @@ if [[ -z "$jump_host" && "${JUMP_PROXY_SERVICE:-}" == host/*@* ]]; then
   jump_host="${JUMP_PROXY_SERVICE#host/}"
   jump_host="${jump_host%@*}"
 fi
-jump_host="${jump_host:-jump-proxy.example.com}"
+jump_host="${jump_host:-jump-proxy.example.invalid}"
 
 if /usr/bin/nc -G "$direct_timeout" -z "$target_host" "$target_port" >/dev/null 2>&1; then
   exec /usr/bin/nc -G "$jump_timeout" "$target_host" "$target_port"

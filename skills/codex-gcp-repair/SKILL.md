@@ -45,7 +45,11 @@ Then validate:
 lsof -nP -iTCP:1080 -sTCP:LISTEN
 lsof -nP -iTCP:7890 -sTCP:LISTEN
 "$REAL_HOME/bin/codex-gcp-remote" traffic-sample 20
-ssh codex-candy-workspace 'ps -eo args | awk "/codex exec/ && !/awk/ {c++} END {print c+0}"'
+REMOTE_HOST="$(
+  . "$REAL_HOME/.config/codex-gcp-refresh/config.env"
+  printf '%s\n' "${REMOTE_HOST:-${SSH_PROBE_TARGET:-}}"
+)"
+ssh "$REMOTE_HOST" 'ps -eo args | awk "/codex exec/ && !/awk/ {c++} END {print c+0}"'
 ```
 
 Expected result:
@@ -71,10 +75,12 @@ Do not run the live one-shot repair merely to test code changes. Run the live re
 Use this only when the user explicitly asks for a full live test. It briefly opens the GCP path, verifies that requested Codex traffic goes through remote `10800`, creates marker-scoped fake stale workers, then stops GCP egress and verifies low traffic:
 
 ```bash
-scripts/live-egress-ci.sh
+scripts/live-egress-ci.sh --yes
 ```
 
 The live CI must end by running `kinit-refresh stop-gcp`. If it fails midway, inspect `/tmp/kinit-refresh.status`, local `1080/7890`, remote `codex exec`, and `codex-gcp-remote traffic-sample 20`.
+
+Use `scripts/live-egress-ci.sh --dry-run` first when validating changes or reviewing a new configuration.
 
 ## Required Validation
 

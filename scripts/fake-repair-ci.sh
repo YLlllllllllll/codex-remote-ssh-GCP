@@ -24,19 +24,23 @@ reject_pattern() {
 }
 
 printf '== static syntax ==\n'
-bash -n bin/kinit-refresh bin/codex-gcp-remote bin/codex-gcp-forward-session bin/codex-gcp-monitor bin/codex-gcp-autoheal bin/codex-workspace-proxy bin/stay-awake.sh scripts/install.sh scripts/fake-repair-ci.sh scripts/live-egress-ci.sh
+bash -n bin/kinit-refresh bin/codex-gcp-remote bin/codex-gcp-forward-session bin/codex-gcp-monitor bin/codex-gcp-autoheal bin/codex-workspace-proxy bin/cursor-remote-reset bin/stay-awake.sh scripts/install.sh scripts/fake-repair-ci.sh scripts/live-egress-ci.sh
 bin/codex-gcp-monitor self-test
 bin/codex-gcp-autoheal self-test
 swiftc -parse app/kinit-refresh-status.swift
 plutil -lint launchd/com.example.kinit-refresh.plist launchd/com.example.kinit-refresh-status.plist launchd/com.example.stay-awake.plist launchd/com.example.codex-gcp-forward.plist launchd/com.example.codex-gcp-monitor.plist launchd/com.example.codex-gcp-autoheal.plist >/dev/null
 python3 -m py_compile tools/codex-http-to-socks.py
-reject_pattern '<string>@/bin/' launchd/com.example.kinit-refresh-status.plist
+if rg -q '<string>@/bin/' launchd; then
+  fail "launchd plist contains unresolved bare @ path"
+fi
 need_pattern 'com.example.kinit-refresh.plist' scripts/install.sh
 need_pattern 'com.example.kinit-refresh"' scripts/install.sh
 
 printf '== app menu contract ==\n'
 need_pattern 'title: "修复 GCP".*refreshRemoteGCP' app/kinit-refresh-status.swift
 need_pattern 'title: "刷新 SSH".*refreshSSH' app/kinit-refresh-status.swift
+need_pattern 'title: "重置 Cursor SSH".*resetCursorSSH' app/kinit-refresh-status.swift
+need_pattern 'cursorResetScript' app/kinit-refresh-status.swift
 need_pattern 'title: "登录/更新 kinit".*loginKinit' app/kinit-refresh-status.swift
 need_pattern 'save-password' app/kinit-refresh-status.swift
 need_pattern 'trafficSummary' app/kinit-refresh-status.swift
@@ -60,7 +64,12 @@ need_pattern 'JUMP_PROXY_SERVICE' bin/codex-workspace-proxy
 need_pattern '/usr/bin/nc -G' bin/codex-workspace-proxy
 need_pattern '^[[:space:]]*-4' bin/codex-workspace-proxy
 need_pattern '^[[:space:]]*-6' bin/codex-workspace-proxy
+need_pattern 'cursor-remote-reset' scripts/install.sh
+need_pattern 'cursor_remote_install' bin/cursor-remote-reset
+need_pattern 'CURSOR_REMOTE_RESET_MIN_AGE' bin/cursor-remote-reset
+reject_pattern 'codex-gcp-monitor|codex-gcp-remote|kinit-refresh remote-gcp|clean-repair-fast|/Applications/Codex.app' bin/cursor-remote-reset
 need_pattern 'gcp\|remote-gcp\|codex-gcp\|refresh-gcp' bin/kinit-refresh
+reject_pattern 'cursor-reset|reset-cursor|cursor-ssh-reset|CURSOR_REMOTE_RESET|reset_cursor_remote_ssh|cursor_remote_install' bin/kinit-refresh
 need_pattern 'KINIT_LIFETIME' bin/kinit-refresh
 need_pattern 'KINIT_RENEWABLE_LIFE' bin/kinit-refresh
 need_pattern 'run_single_kinit_with_timeout' bin/kinit-refresh
@@ -99,9 +108,13 @@ need_pattern 'scripts/fake-repair-ci.sh' scripts/live-egress-ci.sh
 need_pattern 'KINIT_SCRIPT.*stop-gcp' scripts/live-egress-ci.sh
 need_pattern 'repair-fast' scripts/live-egress-ci.sh
 need_pattern 'verify-fast' scripts/live-egress-ci.sh
+need_pattern 'LIVE_EGRESS_REMOTE_HOST' scripts/live-egress-ci.sh
+need_pattern 'CODEX_GCP_LIVE_CI_CONFIRM' scripts/live-egress-ci.sh
+need_pattern '\-\-dry-run' scripts/live-egress-ci.sh
+need_pattern '\-\-yes' scripts/live-egress-ci.sh
 need_pattern 'CODEX_EXEC_CLEAN_MARKER=.*CI_MARKER' scripts/live-egress-ci.sh
 need_pattern 'STALE_CODEX_EXEC_MIN_AGE=1' scripts/live-egress-ci.sh
-reject_pattern '/home/tiger/.local.*/codex exec|/Applications/Codex.app|launchctl setenv|open -a Codex' scripts/live-egress-ci.sh
+reject_pattern 'codex-candy-workspace|/home/tiger/.local.*/codex exec|/Applications/Codex.app|launchctl setenv|open -a Codex' scripts/live-egress-ci.sh
 
 printf '== passive monitor contract ==\n'
 need_pattern 'codex-gcp-monitor \[sample\|status\|tail \[n\]\|path\|self-test\]' bin/codex-gcp-monitor
@@ -160,7 +173,7 @@ if positions != sorted(positions):
 PY
 
 printf '== sensitive information guard ==\n'
-if rg -n -g '!scripts/fake-repair-ci.sh' 'LYC|luyucheng|35\.252|119246|BYTEDANCE|ssh-candy|jump-proxy-arnold|/Users/bytedance' .; then
+if rg -n -g '!scripts/fake-repair-ci.sh' 'LYC|luyucheng|35\.252|119246|BYTEDANCE|Bytedance|ssh-candy|codex-candy|gcp-codex|jump-proxy-arnold|/Users/bytedance|/home/tiger' .; then
   fail "repository contains local/private identifiers"
 fi
 

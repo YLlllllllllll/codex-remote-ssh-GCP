@@ -1,6 +1,11 @@
 import AppKit
 import Foundation
 
+private struct TicketInfo {
+    let expiration: String
+    let renewUntil: String?
+}
+
 final class StatusApp: NSObject, NSApplicationDelegate {
     private let home = NSHomeDirectory()
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -8,6 +13,12 @@ final class StatusApp: NSObject, NSApplicationDelegate {
     private lazy var trafficPath = "\(home)/.codex-gcp-tunnel/monitor-latest.env"
     private lazy var sessionsPath = "\(home)/.codex-gcp-tunnel/active-sessions.txt"
     private lazy var refreshScript = "\(home)/bin/kinit-refresh"
+    private lazy var gcpRemoteScript = "\(home)/bin/codex-gcp-remote"
+    private lazy var autohealScript = "\(home)/bin/codex-gcp-autoheal"
+    private lazy var cursorResetScript = "\(home)/bin/cursor-remote-reset"
+    private lazy var gcpStateDir = "\(home)/.codex-gcp-tunnel"
+    private lazy var gcpDiagnoseLogPath = "\(home)/.codex-gcp-tunnel/gcp-diagnose-latest.log"
+    private lazy var autohealStatusLogPath = "\(home)/.codex-gcp-tunnel/autoheal-status-latest.log"
     private lazy var stayAwakeScript = "\(home)/bin/stay-awake.sh"
     private lazy var stayAwakePlist = "\(home)/Library/LaunchAgents/com.example.stay-awake.plist"
     private let stayAwakeLabel = "com.example.stay-awake"
@@ -16,9 +27,14 @@ final class StatusApp: NSObject, NSApplicationDelegate {
     private var timer: Timer?
     private let summaryItem = NSMenuItem(title: "刷新状态中...", action: nil, keyEquivalent: "")
     private let refreshGCPItem = NSMenuItem(title: "修复 GCP", action: #selector(refreshRemoteGCP), keyEquivalent: "g")
+    private let verifyGCPItem = NSMenuItem(title: "验证 GCP", action: #selector(verifyGCP), keyEquivalent: "v")
+    private let diagnoseGCPItem = NSMenuItem(title: "诊断 GCP", action: #selector(diagnoseGCP), keyEquivalent: "d")
+    private let autohealGCPItem = NSMenuItem(title: "触发 Auto-Heal", action: #selector(triggerAutoheal), keyEquivalent: "h")
+    private let autohealStatusItem = NSMenuItem(title: "查看 Auto-Heal 状态", action: #selector(showAutohealStatus), keyEquivalent: "")
     private let sessionsItem = NSMenuItem(title: "Codex Sessions: 采样中", action: nil, keyEquivalent: "")
     private let sessionsMenu = NSMenu(title: "Codex Sessions")
     private let kinitLoginItem = NSMenuItem(title: "登录/更新 kinit", action: #selector(loginKinit), keyEquivalent: "k")
+    private let resetCursorItem = NSMenuItem(title: "重置 Cursor SSH", action: #selector(resetCursorSSH), keyEquivalent: "u")
     private let toggleStayAwakeItem = NSMenuItem(title: "保持唤醒", action: #selector(toggleStayAwake), keyEquivalent: "a")
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -35,14 +51,20 @@ final class StatusApp: NSObject, NSApplicationDelegate {
         menu.addItem(summaryItem)
         menu.addItem(NSMenuItem.separator())
         menu.addItem(refreshGCPItem)
+        menu.addItem(verifyGCPItem)
+        menu.addItem(diagnoseGCPItem)
+        menu.addItem(autohealGCPItem)
+        menu.addItem(autohealStatusItem)
         sessionsItem.submenu = sessionsMenu
         menu.addItem(sessionsItem)
         menu.addItem(kinitLoginItem)
         menu.addItem(NSMenuItem(title: "刷新 SSH", action: #selector(refreshSSH), keyEquivalent: "r"))
+        menu.addItem(resetCursorItem)
         menu.addItem(toggleStayAwakeItem)
         statusItem.menu = menu
         statusItem.autosaveName = NSStatusItem.AutosaveName("com.example.kinit-refresh-status")
         statusItem.button?.title = "⚪KC"
+        statusItem.isVisible = true
     }
 
     private func updateStatus() {
@@ -53,11 +75,14 @@ final class StatusApp: NSObject, NSApplicationDelegate {
         let ssh = data["SSH"] ?? "unknown"
         let proxy = data["PROXY"] ?? "unknown"
         let codex = data["CODEX"] ?? "unknown"
-        let exp = data["EXP"] ?? ""
         let message = data["MESSAGE"] ?? "暂无状态"
         let updated = data["UPDATED"] ?? "unknown"
         let updatedEpoch = TimeInterval(data["UPDATED_EPOCH"] ?? "") ?? 0
         let isStale = updatedEpoch == 0 || Date().timeIntervalSince1970 - updatedEpoch > staleSeconds
+        let liveTicket = currentTicketInfo()
+        let fileExp = data["EXP"] ?? ""
+        let exp = liveTicket?.expiration ?? (isStale ? "" : fileExp)
+        let renewUntil = liveTicket?.renewUntil
         let monitorGcpOk = traffic["STATUS"] == "ok"
             && traffic["LOCAL_1080_COUNT"] != "0"
             && traffic["LOCAL_7890_COUNT"] != "0"
@@ -78,18 +103,28 @@ final class StatusApp: NSObject, NSApplicationDelegate {
             icon = "🔴"
         }
 
-        let shortExp = shorten(exp)
+        let shortExp = shortExpiration(exp)
+        let shortRenew = shortExpiration(renewUntil ?? "")
+        let longExp = longExpiration(exp)
+        let longRenew = longRenewal(renewUntil)
+        let kinitLabel = [longExp, longRenew].filter { !$0.isEmpty }.joined(separator: "; ")
         let title = icon + "KC"
+        let detailTitle = title + (shortExp.isEmpty ? "" : " \(shortExp)") + (shortRenew.isEmpty ? "" : "→\(shortRenew)")
         let trafficLabel = trafficSummary(traffic)
         statusItem.button?.title = title
-        statusItem.button?.toolTip = "kinit-refresh: \(message) | SSH: \(ssh) | Proxy: \(proxy) | Codex: \(codex) | Exp: \(shortExp) | \(trafficLabel)"
+        statusItem.button?.toolTip = "kinit-refresh: \(message) | Kinit: \(kinitLabel) | SSH: \(ssh) | Proxy: \(proxy) | Codex: \(codex) | \(trafficLabel)"
 
         let gcpState = monitorGcpOk ? "GCP 可用" : message
-        summaryItem.title = "\(title) | SSH: \(ssh) | \(gcpState)"
+        summaryItem.title = "\(detailTitle) | Kinit: \(kinitLabel) | SSH: \(ssh) | \(gcpState)"
         summaryItem.toolTip = "Proxy: \(proxy) | Codex: \(codex) | 更新: \(updated) | \(trafficLabel)"
         refreshGCPItem.title = "修复 GCP    \(trafficLabel)"
         refreshGCPItem.toolTip = trafficTooltip(traffic)
+        verifyGCPItem.toolTip = "只验证本地 1080/7890、远程 10800、GCP 出口 IP 和 ChatGPT Codex endpoint，不重建链路"
+        diagnoseGCPItem.toolTip = "输出本地监听、远程 10800、Codex wrapper、app-server 环境和最近日志到 \(gcpDiagnoseLogPath)"
+        autohealGCPItem.toolTip = "立即运行一轮 codex-gcp-autoheal；只有满足连续失败、冷却窗口等条件时才会触发修复"
+        autohealStatusItem.toolTip = "查看 auto-heal 最近决策和日志尾部"
         kinitLoginItem.toolTip = "输入一次 Kerberos 密码并保存到 macOS Keychain；之后刷新 SSH 会自动执行 kinit"
+        resetCursorItem.toolTip = "只重置 Cursor Remote SSH 的本地 ssh 隧道，不退出 Cursor 主应用"
         updateSessionsMenu(traffic: traffic, sessions: sessions)
 
         let awakeRunning = isStayAwakeRunning()
@@ -201,12 +236,128 @@ final class StatusApp: NSObject, NSApplicationDelegate {
         return String(value[..<end]) + "..."
     }
 
-    private func shorten(_ exp: String) -> String {
+    private func currentTicketInfo() -> TicketInfo? {
+        if let info = currentTicketInfoFromVerboseKlist() {
+            return info
+        }
+        guard let expiration = currentTicketExpirationFromKlist() else {
+            return nil
+        }
+        return TicketInfo(expiration: expiration, renewUntil: nil)
+    }
+
+    private func currentTicketInfoFromVerboseKlist() -> TicketInfo? {
+        guard let output = runKlist(arguments: ["-v"]) else {
+            return nil
+        }
+
+        var inTgtBlock = false
+        var expiration: String?
+        var renewUntil: String?
+
+        for rawLine in output.split(separator: "\n") {
+            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            if line.hasPrefix("Server: ") {
+                inTgtBlock = line.contains("krbtgt/")
+                continue
+            }
+            guard inTgtBlock else { continue }
+
+            if line.hasPrefix("End time:") {
+                expiration = String(line.dropFirst("End time:".count)).trimmingCharacters(in: .whitespacesAndNewlines)
+            } else if line.hasPrefix("Renew till:") {
+                renewUntil = String(line.dropFirst("Renew till:".count)).trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
+
+        guard let expiration else {
+            return nil
+        }
+        return TicketInfo(expiration: expiration, renewUntil: renewUntil)
+    }
+
+    private func currentTicketExpirationFromKlist() -> String? {
+        guard let output = runKlist(arguments: []) else {
+            return nil
+        }
+
+        for line in output.split(separator: "\n") {
+            guard line.contains("krbtgt/") else { continue }
+            let parts = line.split { $0 == " " || $0 == "\t" }.map(String.init)
+            if parts.count >= 8 {
+                return "\(parts[4]) \(parts[5]) \(parts[6]) \(parts[7])"
+            }
+        }
+
+        return nil
+    }
+
+    private func runKlist(arguments: [String]) -> String? {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/klist")
+        task.arguments = arguments
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        task.standardError = FileHandle.nullDevice
+
+        do {
+            try task.run()
+            task.waitUntilExit()
+        } catch {
+            return nil
+        }
+
+        guard task.terminationStatus == 0 else {
+            return nil
+        }
+
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        return String(data: data, encoding: .utf8)
+    }
+
+    private func shortExpiration(_ exp: String) -> String {
+        guard !exp.isEmpty else { return "" }
+        if let date = parseExpiration(exp) {
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.dateFormat = "M/d"
+            return formatter.string(from: date)
+        }
+
         let parts = exp.split(separator: " ").map(String.init)
         if parts.count >= 2 {
             return "\(parts[0])\(parts[1])"
         }
         return exp
+    }
+
+    private func longExpiration(_ exp: String) -> String {
+        guard !exp.isEmpty else { return "未检测到有效票据" }
+        if let date = parseExpiration(exp) {
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.dateFormat = "yyyy-MM-dd HH:mm"
+            return "到 \(formatter.string(from: date))"
+        }
+        return "到 \(exp)"
+    }
+
+    private func longRenewal(_ renew: String?) -> String {
+        guard let renew, !renew.isEmpty else { return "" }
+        if let date = parseExpiration(renew) {
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.dateFormat = "yyyy-MM-dd HH:mm"
+            return "可续到 \(formatter.string(from: date))"
+        }
+        return "可续到 \(renew)"
+    }
+
+    private func parseExpiration(_ exp: String) -> Date? {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "MMM d HH:mm:ss yyyy"
+        return formatter.date(from: exp)
     }
 
     @objc private func refreshSSH() {
@@ -215,6 +366,44 @@ final class StatusApp: NSObject, NSApplicationDelegate {
 
     @objc private func refreshRemoteGCP() {
         runRefresh(title: "🟡KC", arguments: ["remote-gcp"])
+    }
+
+    @objc private func verifyGCP() {
+        runCommand(title: "🟡KC", executable: gcpRemoteScript, arguments: ["verify-fast"])
+    }
+
+    @objc private func diagnoseGCP() {
+        runCommand(
+            title: "🟡KC",
+            executable: gcpRemoteScript,
+            arguments: ["diagnose"],
+            outputPath: gcpDiagnoseLogPath,
+            openOutput: true
+        )
+    }
+
+    @objc private func triggerAutoheal() {
+        runCommand(title: "🟡KC", executable: autohealScript, arguments: ["run"])
+    }
+
+    @objc private func showAutohealStatus() {
+        runCommand(
+            title: "🟡KC",
+            executable: autohealScript,
+            arguments: ["status"],
+            outputPath: autohealStatusLogPath,
+            openOutput: true
+        )
+    }
+
+    @objc private func resetCursorSSH() {
+        statusItem.button?.title = "🟡KC"
+        DispatchQueue.global(qos: .utility).async {
+            self.runProcess(self.cursorResetScript, [])
+            DispatchQueue.main.async {
+                self.updateStatus()
+            }
+        }
     }
 
     @objc private func loginKinit() {
@@ -249,15 +438,42 @@ final class StatusApp: NSObject, NSApplicationDelegate {
     }
 
     private func runRefresh(title: String, arguments: [String]) {
+        runCommand(title: title, executable: refreshScript, arguments: arguments)
+    }
+
+    private func runCommand(
+        title: String,
+        executable: String,
+        arguments: [String],
+        outputPath: String? = nil,
+        openOutput: Bool = false
+    ) {
         statusItem.button?.title = title
         DispatchQueue.global(qos: .utility).async {
             let task = Process()
-            task.executableURL = URL(fileURLWithPath: self.refreshScript)
+            task.executableURL = URL(fileURLWithPath: executable)
             task.arguments = arguments
+            var outputHandle: FileHandle?
+
+            if let outputPath {
+                try? FileManager.default.createDirectory(
+                    atPath: self.gcpStateDir,
+                    withIntermediateDirectories: true
+                )
+                FileManager.default.createFile(atPath: outputPath, contents: nil)
+                outputHandle = FileHandle(forWritingAtPath: outputPath)
+                task.standardOutput = outputHandle ?? FileHandle.nullDevice
+                task.standardError = outputHandle ?? FileHandle.nullDevice
+            }
+
             _ = try? task.run()
             task.waitUntilExit()
+            try? outputHandle?.close()
             DispatchQueue.main.async {
                 self.updateStatus()
+                if openOutput, let outputPath {
+                    NSWorkspace.shared.open(URL(fileURLWithPath: outputPath))
+                }
             }
         }
     }

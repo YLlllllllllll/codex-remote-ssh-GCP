@@ -1,8 +1,9 @@
 #!/bin/bash
-# kinit-refresh — 刷新 Kerberos ticket (REALM.COM)
+# kinit-refresh — refresh Kerberos ticket
 #
 # 用法:
 #   kinit-refresh           # 刷新 ticket
+#   kinit-refresh --dry-run remote-gcp  # 预览会执行的 GCP 修复动作
 #   kinit-refresh status    # 查看当前 ticket 状态
 #   kinit-refresh log       # 查看最近的自动刷新日志
 #   kinit-refresh save-password  # 保存 kinit 密码到 macOS Keychain
@@ -23,7 +24,7 @@ if [ -f "$CONFIG_FILE" ]; then
     . "$CONFIG_FILE"
 fi
 
-PRINCIPAL="${PRINCIPAL:-user.name@REALM.EXAMPLE}"
+PRINCIPAL="${PRINCIPAL:-user.name@EXAMPLE.REALM}"
 LOG_FILE="/tmp/kinit-refresh.log"
 STATUS_FILE="/tmp/kinit-refresh.status"
 LOCK_DIR="/tmp/kinit-refresh.lock"
@@ -38,11 +39,22 @@ KINIT_KEYCHAIN_SERVICE="${KINIT_KEYCHAIN_SERVICE:-example-kinit-refresh}"
 KINIT_KEYCHAIN_ACCOUNT="${KINIT_KEYCHAIN_ACCOUNT:-$PRINCIPAL}"
 KINIT_LIFETIME="${KINIT_LIFETIME:-24h}"
 KINIT_RENEWABLE_LIFE="${KINIT_RENEWABLE_LIFE:-7d}"
-JUMP_PROXY_SERVICE="${JUMP_PROXY_SERVICE:-host/jump-proxy.example.com@REALM.EXAMPLE}"
-SSH_PROBE_TARGET="${SSH_PROBE_TARGET:-remote-workspace}"
+JUMP_PROXY_SERVICE="${JUMP_PROXY_SERVICE:-host/jump-proxy.example.invalid@EXAMPLE.REALM}"
+SSH_PROBE_TARGET="${SSH_PROBE_TARGET:-remote-workspace.example.invalid}"
+JUMP_PROXY_HOST="${JUMP_PROXY_HOST:-}"
+if [ -z "$JUMP_PROXY_HOST" ] && [[ "$JUMP_PROXY_SERVICE" == host/*@* ]]; then
+    JUMP_PROXY_HOST="${JUMP_PROXY_SERVICE#host/}"
+    JUMP_PROXY_HOST="${JUMP_PROXY_HOST%@*}"
+fi
 CODEX_REFRESH_SCRIPT="${CODEX_REFRESH_SCRIPT:-$LOCAL_HOME/bin/codex-gcp-remote}"
 STATE_DIR="${STATE_DIR:-$LOCAL_HOME/.codex-gcp-tunnel}"
 GCP_ENABLED_FILE="${GCP_ENABLED_FILE:-$STATE_DIR/gcp.enabled}"
+DRY_RUN="${KINIT_REFRESH_DRY_RUN:-0}"
+
+if [ "${1:-}" = "--dry-run" ]; then
+    DRY_RUN=1
+    shift
+fi
 
 log() {
     local ts
@@ -131,7 +143,8 @@ reset_ssh_control_masters() {
     local host path pid
 
     log "清理可能失效的 SSH ControlMaster"
-    for host in "$SSH_PROBE_TARGET" "jump-proxy.example.com"; do
+    for host in "$SSH_PROBE_TARGET" "$JUMP_PROXY_HOST"; do
+        [ -n "$host" ] || continue
         path=$(ssh_control_path_for "$host")
         [ -n "$path" ] || continue
 
@@ -246,7 +259,7 @@ save_keychain_password() {
         /usr/bin/security add-generic-password -U \
             -a "$KINIT_KEYCHAIN_ACCOUNT" \
             -s "$KINIT_KEYCHAIN_SERVICE" \
-            -l "Bytedance kinit-refresh password" \
+            -l "kinit-refresh password" \
             -j "Used by $LOCAL_HOME/bin/kinit-refresh to refresh Kerberos ticket" \
             -w
         rc=$?
@@ -266,7 +279,7 @@ save_keychain_password() {
         /usr/bin/security add-generic-password -U \
             -a "$KINIT_KEYCHAIN_ACCOUNT" \
             -s "$KINIT_KEYCHAIN_SERVICE" \
-            -l "Bytedance kinit-refresh password" \
+            -l "kinit-refresh password" \
             -j "Used by $LOCAL_HOME/bin/kinit-refresh to refresh Kerberos ticket" \
             -w "$password"
         rc=$?
@@ -470,6 +483,41 @@ mark_gcp_disabled() {
     rm -f "$GCP_ENABLED_FILE" 2>/dev/null || true
 }
 
+dry_run_plan() {
+    local mode=$1
+
+    echo "DRY RUN: kinit-refresh ${mode}"
+    echo "No Kerberos refresh, SSH probe, status write, marker update, proxy repair, or process cleanup will run."
+
+    case "$mode" in
+        stop-gcp)
+            echo "Would run: codex-gcp-remote --dry-run limit-egress"
+            CODEX_GCP_DRY_RUN=1 "$CODEX_REFRESH_SCRIPT" --dry-run limit-egress 2>/dev/null || true
+            ;;
+        ssh-only)
+            cat <<EOF
+Would:
+  - refresh Kerberos using Keychain password if available
+  - prefetch jump service credentials with kgetcred
+  - probe SSH target ${SSH_PROBE_TARGET}
+  - leave Codex Remote GCP untouched
+EOF
+            ;;
+        remote-gcp)
+            echo "Would run: codex-gcp-remote --dry-run clean-repair-fast, then verify-fast"
+            CODEX_GCP_DRY_RUN=1 "$CODEX_REFRESH_SCRIPT" --dry-run clean-repair-fast 2>/dev/null || true
+            ;;
+        remote-gcp-full)
+            echo "Would probe SSH, then run: codex-gcp-remote --dry-run repair, then verify"
+            CODEX_GCP_DRY_RUN=1 "$CODEX_REFRESH_SCRIPT" --dry-run repair 2>/dev/null || true
+            ;;
+        full)
+            echo "Would refresh Kerberos, verify SSH, then run: codex-gcp-remote --dry-run repair, then verify"
+            CODEX_GCP_DRY_RUN=1 "$CODEX_REFRESH_SCRIPT" --dry-run repair 2>/dev/null || true
+            ;;
+    esac
+}
+
 case "${1:-}" in
     status)
         klist 2>&1
@@ -489,10 +537,18 @@ case "${1:-}" in
         exit 0
         ;;
     save-password|store-password|keychain-save)
+        if [ "$DRY_RUN" = "1" ]; then
+            echo "DRY RUN: would prompt for Kerberos password and save/update the Keychain item ${KINIT_KEYCHAIN_SERVICE}/${KINIT_KEYCHAIN_ACCOUNT}"
+            exit 0
+        fi
         save_keychain_password
         exit $?
         ;;
     delete-password|forget-password|keychain-delete)
+        if [ "$DRY_RUN" = "1" ]; then
+            echo "DRY RUN: would delete the Keychain item ${KINIT_KEYCHAIN_SERVICE}/${KINIT_KEYCHAIN_ACCOUNT}"
+            exit 0
+        fi
         delete_keychain_password
         exit 0
         ;;
@@ -512,10 +568,15 @@ case "${1:-}" in
         MODE="full"
         ;;
     *)
-        echo "Usage: kinit-refresh [status|log|save-password|delete-password|ssh-only|remote-gcp|stop-gcp]" >&2
+        echo "Usage: kinit-refresh [--dry-run] [status|log|save-password|delete-password|ssh-only|remote-gcp|stop-gcp]" >&2
         exit 2
         ;;
 esac
+
+if [ "$DRY_RUN" = "1" ]; then
+    dry_run_plan "$MODE"
+    exit 0
+fi
 
 if ! acquire_lock; then
     RUNNING_PID=$(cat "${LOCK_DIR}/pid" 2>/dev/null || echo "unknown")

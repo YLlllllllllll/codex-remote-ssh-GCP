@@ -16,11 +16,18 @@ remote Codex -> remote 127.0.0.1:10800 HTTP
 The menu-bar app reads `/tmp/kinit-refresh.status` and exposes:
 
 - `修复 GCP`: one-shot forced cleanup, rebuild, and validation for the remote Codex GCP path.
+- `验证 GCP`: read-only validation of local `1080/7890`, remote `10800`, the GCP egress IP, and the ChatGPT Codex endpoint.
+- `诊断 GCP`: writes the local listener state, remote `10800` state, wrapper/config drift, app-server environment, and recent logs to `~/.codex-gcp-tunnel/gcp-diagnose-latest.log`.
+- `触发 Auto-Heal`: runs one auto-heal decision cycle without bypassing the consecutive-failure and cooldown guards.
+- `查看 Auto-Heal 状态`: writes the latest auto-heal decision and log tail to `~/.codex-gcp-tunnel/autoheal-status-latest.log`.
 - `登录/更新 kinit`: prompts once for the Kerberos password, saves it to macOS Keychain, then verifies SSH.
 - `刷新 SSH`: refresh/verify Kerberos and company SSH only.
+- `重置 Cursor SSH`: runs the independent `cursor-remote-reset` helper so Cursor can reconnect, without touching Codex GCP or quitting the Cursor app.
 - `保持唤醒` / `关闭防休眠`: toggles the LaunchAgent-backed stay-awake helper.
 
 `修复 GCP` automatically cleans stale remote sessions and processes before rebuilding the proxy path. It removes stale `codex exec` workers older than `STALE_CODEX_EXEC_MIN_AGE`, stale SSH tunnel sessions, and stale app-server/proxy state. It does not blindly kill every Codex process, so fresh real work is not treated as disposable.
+
+Cursor Remote SSH is deliberately separate from Codex GCP. `修复 GCP`, `remote-gcp`, and auto-heal do not reset Cursor; `重置 Cursor SSH` does not repair, sample, or stop Codex GCP.
 
 When `修复 GCP` succeeds it writes `~/.codex-gcp-tunnel/gcp.enabled`. `stop-gcp` removes that marker. The auto-heal LaunchAgent uses this marker plus the live listener state to decide whether GCP was meant to be on, so it can repair a broken open path without reopening GCP after you intentionally stopped it.
 
@@ -56,11 +63,13 @@ By default the helper requests a `24h` Kerberos ticket with a `7d` renewable win
 
 ```bash
 kinit-refresh status
+kinit-refresh --dry-run remote-gcp
 kinit-refresh ssh-only
 kinit-refresh remote-gcp
 kinit-refresh stop-gcp
 kinit-refresh log
 codex-gcp-autoheal status
+codex-gcp-remote --dry-run clean-repair-fast
 codex-gcp-remote diagnose
 codex-gcp-remote limit-egress
 codex-gcp-remote clean-workers
@@ -138,10 +147,18 @@ scripts/fake-repair-ci.sh
 For an explicit live smoke test, use:
 
 ```bash
-scripts/live-egress-ci.sh
+scripts/live-egress-ci.sh --yes
 ```
 
 This one is intentionally named as live CI because it briefly opens the GCP egress path, verifies remote `10800` and ChatGPT endpoint reachability, creates marker-scoped fake stale workers, then runs `kinit-refresh stop-gcp` and verifies the tunnel is closed with low GCP traffic. Do not run it while real long-running `codex exec` jobs are expected to remain active.
+
+Preview live or destructive flows first with `--dry-run`:
+
+```bash
+kinit-refresh --dry-run remote-gcp
+codex-gcp-remote --dry-run clean-repair-fast
+scripts/live-egress-ci.sh --dry-run
+```
 
 ## Cost Controls
 

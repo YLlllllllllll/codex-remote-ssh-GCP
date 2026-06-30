@@ -5,10 +5,18 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LOCAL_USER="$(id -un)"
 REAL_HOME="$(dscl . -read "/Users/${LOCAL_USER}" NFSHomeDirectory 2>/dev/null | awk '{ print $2; exit }')"
 REAL_HOME="${REAL_HOME:-${HOME:?}}"
+CONFIG_FILE="${CODEX_GCP_REFRESH_CONFIG:-$REAL_HOME/.config/codex-gcp-refresh/config.env}"
+if [[ -f "$CONFIG_FILE" ]]; then
+  # shellcheck disable=SC1090
+  . "$CONFIG_FILE"
+fi
 
 REMOTE_SCRIPT="${REAL_HOME}/bin/codex-gcp-remote"
 KINIT_SCRIPT="${REAL_HOME}/bin/kinit-refresh"
+REMOTE_HOST="${LIVE_EGRESS_REMOTE_HOST:-${REMOTE_HOST:-${SSH_PROBE_TARGET:-}}}"
 CI_MARKER=""
+CONFIRM="${CODEX_GCP_LIVE_CI_CONFIRM:-0}"
+DRY_RUN=0
 
 fail() {
   printf 'live-egress-ci: %s\n' "$*" >&2
@@ -21,6 +29,63 @@ log() {
 
 require_executable() {
   [[ -x "$1" ]] || fail "missing executable: $1"
+}
+
+usage() {
+  cat <<EOF
+Usage: $(basename "$0") [--dry-run] [--yes]
+
+Runs a live smoke test that opens the configured GCP egress path, verifies it,
+creates marker-scoped fake stale workers, then stops the path again.
+
+Options:
+  --dry-run  Print the planned live actions and exit.
+  --yes      Confirm the live test. Equivalent to CODEX_GCP_LIVE_CI_CONFIRM=1.
+
+Configuration:
+  REMOTE_HOST or SSH_PROBE_TARGET must be set in $CONFIG_FILE, or set
+  LIVE_EGRESS_REMOTE_HOST for this command.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run)
+      DRY_RUN=1
+      ;;
+    --yes|-y)
+      CONFIRM=1
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
+
+dry_run_plan() {
+  cat <<EOF
+DRY RUN: live egress CI
+No SSH commands, proxy repairs, worker cleanup, or GCP stop/start operations will run.
+
+Would use:
+  remote host: ${REMOTE_HOST:-<unset>}
+  remote script: $REMOTE_SCRIPT
+  kinit script: $KINIT_SCRIPT
+
+Would:
+  - run scripts/fake-repair-ci.sh
+  - run kinit-refresh stop-gcp and verify local listeners are closed
+  - sample GCP traffic
+  - create and clean marker-scoped fake stale remote workers
+  - run codex-gcp-remote repair-fast and verify-fast
+  - run kinit-refresh stop-gcp again and verify low traffic
+EOF
 }
 
 listener_count() {
@@ -37,7 +102,7 @@ assert_no_local_egress() {
 
 assert_remote_no_workers_or_sockets() {
   local out workers sockets
-  out="$(ssh codex-candy-workspace 'printf "workers="; ps -eo args | awk "/codex exec/ && !/awk/ {c++} END {print c+0}"; printf "sockets="; ss -tnp 2>/dev/null | grep "127.0.0.1:10800" | wc -l')"
+  out="$(ssh "$REMOTE_HOST" 'printf "workers="; ps -eo args | awk "/codex exec/ && !/awk/ {c++} END {print c+0}"; printf "sockets="; ss -tnp 2>/dev/null | grep "127.0.0.1:10800" | wc -l')"
   printf '%s\n' "$out"
   workers="$(awk -F= '$1=="workers" {print $2}' <<<"$out" | tr -d '[:space:]')"
   sockets="$(awk -F= '$1=="sockets" {print $2}' <<<"$out" | tr -d '[:space:]')"
@@ -57,7 +122,7 @@ assert_status_stopped() {
 
 spawn_fake_stale_worker() {
   local marker="$1"
-  ssh codex-candy-workspace "marker='$marker' bash -s" <<'REMOTE'
+  ssh "$REMOTE_HOST" "marker='$marker' bash -s" <<'REMOTE'
 set -Eeuo pipefail
 nohup bash -c 'exec -a "/tmp/codex-egress-ci/bin/codex exec resume ${marker}" sleep 600' >/dev/null 2>&1 &
 printf '%s\n' "$!"
@@ -66,14 +131,14 @@ REMOTE
 
 count_marker_workers() {
   local marker="$1"
-  ssh codex-candy-workspace "marker='$marker' bash -s" <<'REMOTE'
+  ssh "$REMOTE_HOST" "marker='$marker' bash -s" <<'REMOTE'
 ps -eo args= 2>/dev/null | awk -v marker="$marker" '/\/bin\/codex exec/ && index($0, marker) {count++} END {print count + 0}'
 REMOTE
 }
 
 cleanup_marker_workers() {
   local marker="$1"
-  ssh codex-candy-workspace "marker='$marker' bash -s" <<'REMOTE' || true
+  ssh "$REMOTE_HOST" "marker='$marker' bash -s" <<'REMOTE' || true
 pids="$(ps -eo pid=,args= 2>/dev/null | awk -v marker="$marker" '/\/bin\/codex exec/ && index($0, marker) {print $1}')"
 if [ -n "$pids" ]; then
   kill $pids 2>/dev/null || true
@@ -85,6 +150,12 @@ REMOTE
 
 main() {
   cd "$ROOT"
+  if [[ "$DRY_RUN" == "1" ]]; then
+    dry_run_plan
+    exit 0
+  fi
+  [[ -n "$REMOTE_HOST" ]] || fail "REMOTE_HOST/SSH_PROBE_TARGET is not configured; set LIVE_EGRESS_REMOTE_HOST or edit $CONFIG_FILE"
+  [[ "$CONFIRM" == "1" ]] || fail "live egress CI opens and stops GCP egress; rerun with --yes or CODEX_GCP_LIVE_CI_CONFIRM=1"
   require_executable "$REMOTE_SCRIPT"
   require_executable "$KINIT_SCRIPT"
 

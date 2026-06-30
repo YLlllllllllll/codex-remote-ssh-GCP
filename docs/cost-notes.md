@@ -13,8 +13,8 @@ CPU can spike during encrypted SSH forwarding, but normal idle CPU should be nea
 Useful checks:
 
 ```bash
-ssh gcp-codex-443 'uptime; ps -eo pid,ppid,user,stat,etime,%cpu,%mem,args --sort=-%cpu | head -30'
-ssh gcp-codex-443 'cat /proc/net/dev'
+ssh "$GCP_SSH_ALIAS" 'uptime; ps -eo pid,ppid,user,stat,etime,%cpu,%mem,args --sort=-%cpu | head -30'
+ssh "$GCP_SSH_ALIAS" 'cat /proc/net/dev'
 lsof -nP -iTCP:1080 -iTCP:7890
 cat ~/.codex-gcp-tunnel/active-sessions.txt
 ```

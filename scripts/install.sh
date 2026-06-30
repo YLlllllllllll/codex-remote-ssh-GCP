@@ -22,6 +22,7 @@ install -m 0755 "$ROOT/bin/codex-gcp-forward-session" "$BIN_DIR/codex-gcp-forwar
 install -m 0755 "$ROOT/bin/codex-gcp-monitor" "$BIN_DIR/codex-gcp-monitor"
 install -m 0755 "$ROOT/bin/codex-gcp-autoheal" "$BIN_DIR/codex-gcp-autoheal"
 install -m 0755 "$ROOT/bin/codex-workspace-proxy" "$BIN_DIR/codex-workspace-proxy"
+install -m 0755 "$ROOT/bin/cursor-remote-reset" "$BIN_DIR/cursor-remote-reset"
 install -m 0755 "$ROOT/bin/stay-awake.sh" "$BIN_DIR/stay-awake.sh"
 
 swiftc "$ROOT/app/kinit-refresh-status.swift" -o "$BIN_DIR/kinit-refresh-status"

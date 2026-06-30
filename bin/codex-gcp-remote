@@ -6,14 +6,14 @@ set -Eeuo pipefail
 # Background
 # ----------
 # This machine uses Codex App / Codex CLI Remote connections to reach the
-# company remote devbox `remote-workspace` as user tiger. The remote devbox
+# remote development box configured by REMOTE_HOST. The remote devbox
 # cannot reliably reach ChatGPT/OpenAI directly, so only official Codex traffic
 # should go through a GCP VM as an overseas egress.
 #
 # Fixed intended chain:
 #
 #   local 127.0.0.1:1080 SOCKS
-#     -> ssh -D over GCP 203.0.113.10:443
+#     -> ssh -D over the configured GCP VM on port 443
 #     -> GCP egress
 #
 #   local 127.0.0.1:7890 HTTP
@@ -60,14 +60,13 @@ if [[ -f "$CONFIG_FILE" ]]; then
   . "$CONFIG_FILE"
 fi
 
-GCP_HOST="${GCP_HOST:-203.0.113.10}"
+GCP_HOST="${GCP_HOST:-192.0.2.10}"
 GCP_USER="${GCP_USER:-gcp-user}"
 GCP_PORT="${GCP_PORT:-443}"
 GCP_KEY="${GCP_KEY:-$LOCAL_HOME/.ssh/google_compute_engine}"
-GCP_EXPECTED_IP="${GCP_EXPECTED_IP:-203.0.113.10}"
+GCP_EXPECTED_IP="${GCP_EXPECTED_IP:-192.0.2.10}"
 
-REMOTE_HOST="${REMOTE_HOST:-${SSH_PROBE_TARGET:-remote-workspace}}"
-REMOTE_HOME="${REMOTE_HOME:-/home/tiger}"
+REMOTE_HOST="${REMOTE_HOST:-${SSH_PROBE_TARGET:-remote-workspace.example.invalid}}"
 
 LOCAL_SOCKS_HOST="${LOCAL_SOCKS_HOST:-127.0.0.1}"
 LOCAL_SOCKS_PORT="${LOCAL_SOCKS_PORT:-1080}"
@@ -100,6 +99,7 @@ REMOTE_CONTROL_PATH="$STATE_DIR/remote-forward.cm"
 REMOTE_FORWARD_PID_FILE="$STATE_DIR/remote-forward.manual.pid"
 REMOTE_FORWARD_LABEL="${REMOTE_FORWARD_LABEL:-com.example.codex-gcp-forward}"
 REMOTE_FORWARD_PLIST="${REMOTE_FORWARD_PLIST:-$LOCAL_HOME/Library/LaunchAgents/${REMOTE_FORWARD_LABEL}.plist}"
+DRY_RUN="${CODEX_GCP_DRY_RUN:-0}"
 
 LOCAL_SOCKS_URL="socks5h://${LOCAL_SOCKS_HOST}:${LOCAL_SOCKS_PORT}"
 LOCAL_HTTP_URL="http://${LOCAL_HTTP_HOST}:${LOCAL_HTTP_PORT}"
@@ -108,6 +108,7 @@ REMOTE_HTTP_URL="http://${REMOTE_HTTP_HOST}:${REMOTE_HTTP_PORT}"
 usage() {
   cat <<EOF
 Usage: $(basename "$0") <command>
+       $(basename "$0") --dry-run <command>
 
 Commands:
   diagnose   Print local/remote tunnel, wrapper, process, and config state.
@@ -131,6 +132,10 @@ Commands:
              Verify remote 10800 egress and ChatGPT endpoint reachability.
   status     Alias for diagnose.
 
+Options:
+  --dry-run  Print the planned actions without changing routes, listeners,
+             LaunchAgents, remote wrappers, or local/remote processes.
+
 Examples:
   $(basename "$0") diagnose
   $(basename "$0") repair
@@ -142,6 +147,92 @@ Fixed ports:
   remote HTTP  ${REMOTE_HTTP_HOST}:${REMOTE_HTTP_PORT}
   GCP SSH      ${GCP_USER}@${GCP_HOST}:${GCP_PORT}
 EOF
+}
+
+dry_run_plan() {
+  local planned_cmd="${1:-}"
+  local seconds="${2:-$GCP_TRAFFIC_SAMPLE_SECONDS}"
+
+  printf 'DRY RUN: %s %s\n' "$(basename "$0")" "${planned_cmd:-help}"
+  printf 'No SSH commands, route changes, port binds, LaunchAgent changes, wrapper writes, or process kills will run.\n'
+  printf 'Configured targets: local SOCKS %s:%s, local HTTP %s:%s, remote HTTP %s:%s, GCP %s@%s:%s\n' \
+    "$LOCAL_SOCKS_HOST" "$LOCAL_SOCKS_PORT" \
+    "$LOCAL_HTTP_HOST" "$LOCAL_HTTP_PORT" \
+    "$REMOTE_HTTP_HOST" "$REMOTE_HTTP_PORT" \
+    "$GCP_USER" "$GCP_HOST" "$GCP_PORT"
+
+  case "$planned_cmd" in
+    repair)
+      cat <<EOF
+Would:
+  - stop any legacy local GCP SOCKS LaunchAgent if present
+  - ensure the GCP host route bypasses stale VPN routing
+  - ensure local SSH SOCKS on ${LOCAL_SOCKS_HOST}:${LOCAL_SOCKS_PORT}
+  - ensure local privoxy HTTP on ${LOCAL_HTTP_HOST}:${LOCAL_HTTP_PORT}
+  - verify/write remote Codex wrappers and proxy.env
+  - kill stale remote app-server/proxy processes tied to old proxy state
+  - clean stale remote codex exec workers older than ${STALE_CODEX_EXEC_MIN_AGE}s
+  - ensure remote reverse HTTP forward on ${REMOTE_HTTP_HOST}:${REMOTE_HTTP_PORT}
+EOF
+      ;;
+    repair-fast)
+      cat <<EOF
+Would:
+  - ensure the GCP host route bypasses stale VPN routing
+  - ensure local SSH SOCKS on ${LOCAL_SOCKS_HOST}:${LOCAL_SOCKS_PORT}
+  - ensure local privoxy HTTP on ${LOCAL_HTTP_HOST}:${LOCAL_HTTP_PORT}
+  - clean stale remote codex exec workers older than ${STALE_CODEX_EXEC_MIN_AGE}s
+  - ensure remote reverse HTTP forward on ${REMOTE_HTTP_HOST}:${REMOTE_HTTP_PORT}
+EOF
+      ;;
+    clean-repair-fast)
+      cat <<EOF
+Would:
+  - stop any legacy local GCP SOCKS LaunchAgent if present
+  - kill local listeners on ${LOCAL_HTTP_PORT} and ${LOCAL_SOCKS_PORT}
+  - cancel/reset remote ${REMOTE_HTTP_PORT} forwards and stale SSH tunnel sessions
+  - restart remote Codex app-server processes
+  - rebuild local SOCKS, local HTTP, and remote reverse HTTP forwarding
+  - clean stale remote codex exec workers older than ${STALE_CODEX_EXEC_MIN_AGE}s
+EOF
+      ;;
+    stop-egress)
+      cat <<EOF
+Would:
+  - cancel/reset remote ${REMOTE_HTTP_PORT} forwarding ControlMasters
+  - stop the launchd-managed remote forward if loaded
+  - kill local listeners on ${LOCAL_HTTP_PORT} and ${LOCAL_SOCKS_PORT}
+EOF
+      ;;
+    limit-egress)
+      cat <<EOF
+Would:
+  - stop local and remote GCP forwarding
+  - clean stale remote codex exec workers older than ${STALE_CODEX_EXEC_MIN_AGE}s
+  - sample GCP interface ${GCP_TRAFFIC_IFACE} for ${GCP_TRAFFIC_SAMPLE_SECONDS}s
+EOF
+      ;;
+    clean-workers)
+      cat <<EOF
+Would:
+  - list and terminate remote codex exec workers older than ${STALE_CODEX_EXEC_MIN_AGE}s
+  - restrict cleanup to marker ${CODEX_EXEC_CLEAN_MARKER} if CODEX_EXEC_CLEAN_MARKER is set
+EOF
+      ;;
+    traffic-sample)
+      cat <<EOF
+Would:
+  - read GCP interface ${GCP_TRAFFIC_IFACE} counters before and after ${seconds}s
+  - compare total RX+TX delta with ${GCP_TRAFFIC_LIMIT_BYTES} bytes
+EOF
+      ;;
+    diagnose|status|verify|verify-fast)
+      printf 'This command is read-only validation/diagnosis; dry-run skipped execution.\n'
+      ;;
+    *)
+      usage
+      ;;
+  esac
 }
 
 section() {
@@ -226,6 +317,18 @@ route_field() {
   route -n get "$target" 2>/dev/null | awk -v f="$field" '$1 == f ":" { print $2; exit }'
 }
 
+gcp_bind_address() {
+  if [[ -n "${GCP_BIND_ADDRESS:-}" ]]; then
+    printf '%s\n' "$GCP_BIND_ADDRESS"
+    return 0
+  fi
+
+  local iface
+  iface="$(route_field "$GCP_HOST" interface)"
+  [[ -n "$iface" && "$iface" != utun* ]] || return 0
+  ifconfig "$iface" 2>/dev/null | awk '$1 == "inet" { print $2; exit }'
+}
+
 ensure_gcp_host_route() {
   local iface gateway current_gateway
 
@@ -292,6 +395,9 @@ ssh_gcp() {
   [[ -n "$GCP_SSH_KEX_ALGORITHMS" ]] && extra_opts+=(-o "KexAlgorithms=$GCP_SSH_KEX_ALGORITHMS")
   [[ -n "$GCP_SSH_HOST_KEY_ALGORITHMS" ]] && extra_opts+=(-o "HostKeyAlgorithms=$GCP_SSH_HOST_KEY_ALGORITHMS")
   [[ -n "$GCP_SSH_CIPHERS" ]] && extra_opts+=(-o "Ciphers=$GCP_SSH_CIPHERS")
+  local bind_address
+  bind_address="$(gcp_bind_address)"
+  [[ -n "$bind_address" ]] && extra_opts+=(-b "$bind_address")
 
   ssh \
     -i "$GCP_KEY" \
@@ -497,6 +603,9 @@ start_local_socks() {
   [[ -n "$GCP_SSH_KEX_ALGORITHMS" ]] && extra_opts+=(-o "KexAlgorithms=$GCP_SSH_KEX_ALGORITHMS")
   [[ -n "$GCP_SSH_HOST_KEY_ALGORITHMS" ]] && extra_opts+=(-o "HostKeyAlgorithms=$GCP_SSH_HOST_KEY_ALGORITHMS")
   [[ -n "$GCP_SSH_CIPHERS" ]] && extra_opts+=(-o "Ciphers=$GCP_SSH_CIPHERS")
+  local bind_address
+  bind_address="$(gcp_bind_address)"
+  [[ -n "$bind_address" ]] && extra_opts+=(-b "$bind_address")
 
   ssh -fN \
     -E "$STATE_DIR/gcp-socks.manual.log" \
@@ -589,7 +698,7 @@ EOF
 restore_remote_official_js_if_needed() {
   section "Check remote official codex.js"
   local first
-  first="$(ssh_remote "head -1 '$REMOTE_HOME/.local/node/lib/node_modules/@openai/codex/bin/codex.js' 2>/dev/null || true")"
+  first="$(ssh_remote 'head -1 "$HOME/.local/node/lib/node_modules/@openai/codex/bin/codex.js" 2>/dev/null || true')"
   if [[ "$first" == "#!/usr/bin/env node" ]]; then
     printf 'remote official codex.js is already intact\n'
     return
@@ -597,7 +706,7 @@ restore_remote_official_js_if_needed() {
 
   printf 'remote codex.js is not official JS; restoring from npm package\n'
   local version tmp pkg
-  version="$(ssh_remote "sed -n 's/.*\"version\": \"\\([^\"]*\\)\".*/\\1/p' '$REMOTE_HOME/.local/node/lib/node_modules/@openai/codex/package.json' | head -n 1" 2>/dev/null || true)"
+  version="$(ssh_remote 'node -p "require(process.env.HOME + \"/.local/node/lib/node_modules/@openai/codex/package.json\").version" 2>/dev/null || true' 2>/dev/null || true)"
   version="${version:-0.135.0}"
   tmp="$(mktemp -d /tmp/codex-npm.XXXXXX)"
   (
@@ -609,7 +718,7 @@ restore_remote_official_js_if_needed() {
     tar -xzf "$pkg" package/bin/codex.js
   )
   scp "$tmp/package/bin/codex.js" "$REMOTE_HOST:/tmp/codex.js.official.$version" >/dev/null
-  ssh_remote "install -m 0755 '/tmp/codex.js.official.$version' '$REMOTE_HOME/.local/node/lib/node_modules/@openai/codex/bin/codex.js' && rm -f '/tmp/codex.js.official.$version'"
+  ssh_remote "install -m 0755 '/tmp/codex.js.official.$version' \"\$HOME/.local/node/lib/node_modules/@openai/codex/bin/codex.js\" && rm -f '/tmp/codex.js.official.$version'"
   rm -rf "$tmp"
 }
 
@@ -623,9 +732,9 @@ set -Eeuo pipefail
 [[ "$(head -1 "$HOME/.local/node/lib/node_modules/@openai/codex/bin/codex.js" 2>/dev/null)" == "#!/usr/bin/env node" ]]
 grep -q 'Inner guard' "$HOME/.local/node/bin/codex"
 grep -q '127\.0\.0\.1:10800' "$HOME/.codex/proxy.env"
-! grep -Eq '127\.0\.0\.1:18080|127\.0\.0\.1:18081|modelhub|azure|OPENAI_BASE_URL|aidp\.example' "$HOME/.codex/proxy.env"
+! grep -Eq '127\.0\.0\.1:18080|127\.0\.0\.1:18081|modelhub|azure|OPENAI_BASE_URL|custom-provider\.example' "$HOME/.codex/proxy.env"
 if [[ -f "$HOME/.codex/config.toml" ]]; then
-  ! grep -Eq 'model_provider|model_providers|OPENAI_BASE_URL|aidp\.example|azure|modelhub|127\.0\.0\.1:18080|127\.0\.0\.1:18081' "$HOME/.codex/config.toml"
+  ! grep -Eq 'model_provider|model_providers|OPENAI_BASE_URL|custom-provider\.example|azure|modelhub|127\.0\.0\.1:18080|127\.0\.0\.1:18081' "$HOME/.codex/config.toml"
 fi
 "$HOME/.local/bin/codex" --version | grep -q '^codex-cli '
 REMOTE
@@ -635,7 +744,7 @@ ensure_remote_wrappers() {
   section "Ensure remote Codex wrappers"
   if remote_wrappers_healthy; then
     printf 'remote Codex wrappers already healthy; leaving active app-server untouched\n'
-    ssh_remote "sha256sum '$REMOTE_HOME/.local/bin/codex-gcp' '$REMOTE_HOME/.local/node/bin/codex'; readlink -f '$REMOTE_HOME/.local/bin/codex'; '$REMOTE_HOME/.local/bin/codex' --version"
+    ssh_remote 'sha256sum "$HOME/.local/bin/codex-gcp" "$HOME/.local/node/bin/codex"; readlink -f "$HOME/.local/bin/codex"; "$HOME/.local/bin/codex" --version'
     return
   fi
 
@@ -659,8 +768,8 @@ ALL_PROXY=http://127.0.0.1:10800
 http_proxy=http://127.0.0.1:10800
 https_proxy=http://127.0.0.1:10800
 all_proxy=http://127.0.0.1:10800
-NO_PROXY=localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.corp.example,.example.net,aidp.example.net
-no_proxy=localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.corp.example,.example.net,aidp.example.net
+NO_PROXY=localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.internal.example.invalid
+no_proxy=localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.internal.example.invalid
 EOF
 chmod 600 "$HOME/.codex/proxy.env"
 
@@ -669,7 +778,7 @@ if [[ ! -f "$HOME/.codex/auth.json" && -f "$HOME/.codex-gcp/auth.json" ]]; then
   chmod 600 "$HOME/.codex/auth.json"
 fi
 
-if [[ -f "$HOME/.codex/config.toml" ]] && grep -Eq 'model_provider|model_providers|OPENAI_BASE_URL|aidp\.example|azure|modelhub' "$HOME/.codex/config.toml"; then
+if [[ -f "$HOME/.codex/config.toml" ]] && grep -Eq 'model_provider|model_providers|OPENAI_BASE_URL|custom-provider\.example|azure|modelhub' "$HOME/.codex/config.toml"; then
   mv "$HOME/.codex/config.toml" "$HOME/.codex/config.toml.disabled.$(date +%Y%m%d%H%M%S)"
 fi
 
@@ -695,7 +804,7 @@ export ALL_PROXY="http://127.0.0.1:10800"
 export http_proxy="$HTTP_PROXY"
 export https_proxy="$HTTPS_PROXY"
 export all_proxy="$ALL_PROXY"
-export NO_PROXY="localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.corp.example,.example.net,aidp.example.net"
+export NO_PROXY="localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.internal.example.invalid"
 export no_proxy="$NO_PROXY"
 unset OPENAI_API_KEY OPENAI_BASE_URL OPENAI_ORG_ID OPENAI_ORGANIZATION OPENAI_PROJECT OPENAI_PROJECT_ID
 
@@ -735,7 +844,7 @@ export ALL_PROXY="http://127.0.0.1:10800"
 export http_proxy="$HTTP_PROXY"
 export https_proxy="$HTTPS_PROXY"
 export all_proxy="$ALL_PROXY"
-export NO_PROXY="localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.corp.example,.example.net,aidp.example.net"
+export NO_PROXY="localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.internal.example.invalid"
 export no_proxy="$NO_PROXY"
 unset OPENAI_API_KEY OPENAI_BASE_URL OPENAI_ORG_ID OPENAI_ORGANIZATION OPENAI_PROJECT OPENAI_PROJECT_ID
 
@@ -1026,7 +1135,7 @@ diagnose() {
   printf 'via 7890:    %s\n' "$(curl_ip_local_http)"
 
   section "GCP SSH"
-  ssh -i "$GCP_KEY" -o IdentitiesOnly=yes -p "$GCP_PORT" -o ConnectTimeout=10 "${GCP_USER}@${GCP_HOST}" 'echo GCP_443_OK; hostname' || true
+  ssh_gcp 'echo GCP_443_OK; hostname' || true
 
   section "Remote traffic split"
   ssh_remote "ss -ltn 2>/dev/null | egrep ':${REMOTE_HTTP_PORT}|:18080|:18081' || true"
@@ -1034,10 +1143,10 @@ diagnose() {
   printf 'remote plain:     %s\n' "$(ssh_remote "curl -sS --connect-timeout 3 --max-time '$IP_CHECK_TIMEOUT' '$IP_CHECK_URL'" 2>/dev/null || true)"
 
   section "Remote Codex path and wrappers"
-  ssh_remote "which -a codex 2>/dev/null || true; readlink -f '$REMOTE_HOME/.local/bin/codex' 2>/dev/null || true; codex --version 2>&1 || true; printf '\n-- outer --\n'; head -40 '$REMOTE_HOME/.local/bin/codex-gcp' 2>/dev/null || true; printf '\n-- inner --\n'; head -40 '$REMOTE_HOME/.local/node/bin/codex' 2>/dev/null || true"
+  ssh_remote 'which -a codex 2>/dev/null || true; readlink -f "$HOME/.local/bin/codex" 2>/dev/null || true; codex --version 2>&1 || true; printf "\n-- outer --\n"; head -40 "$HOME/.local/bin/codex-gcp" 2>/dev/null || true; printf "\n-- inner --\n"; head -40 "$HOME/.local/node/bin/codex" 2>/dev/null || true'
 
   section "Remote config drift"
-  ssh_remote "printf -- '-- proxy.env --\n'; cat '$REMOTE_HOME/.codex/proxy.env' 2>/dev/null || true; printf -- '\n-- config.toml --\n'; cat '$REMOTE_HOME/.codex/config.toml' 2>/dev/null || true"
+  ssh_remote 'printf -- "-- proxy.env --\n"; cat "$HOME/.codex/proxy.env" 2>/dev/null || true; printf -- "\n-- config.toml --\n"; cat "$HOME/.codex/config.toml" 2>/dev/null || true'
 
   section "Remote stale process scan"
   ssh_remote "ps -eo pid=,ppid=,args= | grep -E 'codex app-server proxy|app-server --listen unix://|modelhub|install-codex|18080|18081' | grep -v grep || true"
@@ -1126,7 +1235,7 @@ verify() {
   out="$(ssh_remote "set -e
 printf '== direct remote codex path ==\n'
 which codex
-readlink -f '$REMOTE_HOME/.local/bin/codex'
+readlink -f \$HOME/.local/bin/codex
 printf '== direct remote codex version ==\n'
 codex --version
 printf '== remote 10800 proxy IP ==\n'
@@ -1162,7 +1271,29 @@ esac
   fi
 }
 
+args=()
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run)
+      DRY_RUN=1
+      ;;
+    *)
+      args+=("$arg")
+      ;;
+  esac
+done
+set -- "${args[@]}"
+
 cmd="${1:-}"
+case "$cmd" in
+  repair|repair-fast|clean-repair-fast|stop-egress|limit-egress|clean-workers|traffic-sample|diagnose|status|verify|verify-fast)
+    if [[ "$DRY_RUN" == "1" ]]; then
+      dry_run_plan "$cmd" "${2:-}"
+      exit 0
+    fi
+    ;;
+esac
+
 case "$cmd" in
   diagnose|status)
     diagnose
