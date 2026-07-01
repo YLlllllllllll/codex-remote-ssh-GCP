@@ -163,7 +163,7 @@ cooldown_remaining() {
 }
 
 should_autoheal() {
-  local status cause fails remaining stale_sockets remote_count local_http_ip
+  local status cause fails remaining stale_sockets active_sockets remote_count local_http_ip
 
   [[ "$CODEX_GCP_AUTOHEAL_ENABLED" == "1" ]] || {
     printf 'skip: autoheal disabled\n'
@@ -185,15 +185,20 @@ should_autoheal() {
     return 1
   }
   stale_sockets="$(number_or_zero "$(kv_value REMOTE_10800_STALE_SOCKET_COUNT)")"
+  active_sockets="$(number_or_zero "$(kv_value REMOTE_10800_ACTIVE_SOCKET_COUNT)")"
   remote_count="$(number_or_zero "$(kv_value REMOTE_10800_COUNT)")"
   local_http_ip="$(kv_value LOCAL_7890_IP)"
   if [[ "$stale_sockets" -ge "$AUTOHEAL_STALE_SOCKET_THRESHOLD" ]]; then
+    if [[ "$status" != "fail" && "$stale_sockets" -lt "$active_sockets" ]]; then
+      printf 'skip: stale sockets above threshold but active sockets dominate stale=%s active=%s threshold=%s\n' "$stale_sockets" "$active_sockets" "$AUTOHEAL_STALE_SOCKET_THRESHOLD"
+      return 1
+    fi
     remaining="$(number_or_zero "$(cooldown_remaining "$AUTOHEAL_SOCKET_STORM_LAST_FILE" "$AUTOHEAL_SOCKET_STORM_COOLDOWN_SECONDS")")"
     if [[ "$remaining" -gt 0 ]]; then
       printf 'skip: socket-storm cooldown %ss remaining\n' "$remaining"
       return 1
     fi
-    printf 'heal: cause=remote_10800_socket_storm stale_sockets=%s threshold=%s\n' "$stale_sockets" "$AUTOHEAL_STALE_SOCKET_THRESHOLD"
+    printf 'heal: cause=remote_10800_socket_storm stale_sockets=%s active_sockets=%s threshold=%s status=%s\n' "$stale_sockets" "$active_sockets" "$AUTOHEAL_STALE_SOCKET_THRESHOLD" "$status"
     return 0
   fi
   if [[ "$remote_count" -gt 0 && "$local_http_ip" == "${GCP_EXPECTED_IP:-}" ]]; then
@@ -236,10 +241,36 @@ should_autoheal() {
 
 acquire_lock() {
   mkdir -p "$STATE_DIR"
-  mkdir "$AUTOHEAL_LOCK_DIR" 2>/dev/null
+  if mkdir "$AUTOHEAL_LOCK_DIR" 2>/dev/null; then
+    printf '%s\n' "$$" > "$AUTOHEAL_LOCK_DIR/pid"
+    date '+%Y-%m-%d %H:%M:%S' > "$AUTOHEAL_LOCK_DIR/started"
+    return 0
+  fi
+
+  local owner_pid
+  owner_pid="$(head -n 1 "$AUTOHEAL_LOCK_DIR/pid" 2>/dev/null || true)"
+  case "$owner_pid" in
+    ''|*[!0-9]*)
+      rm -rf "$AUTOHEAL_LOCK_DIR" 2>/dev/null || true
+      ;;
+    *)
+      if ! kill -0 "$owner_pid" 2>/dev/null; then
+        rm -rf "$AUTOHEAL_LOCK_DIR" 2>/dev/null || true
+      fi
+      ;;
+  esac
+
+  if mkdir "$AUTOHEAL_LOCK_DIR" 2>/dev/null; then
+    printf '%s\n' "$$" > "$AUTOHEAL_LOCK_DIR/pid"
+    date '+%Y-%m-%d %H:%M:%S' > "$AUTOHEAL_LOCK_DIR/started"
+    return 0
+  fi
+
+  return 1
 }
 
 release_lock() {
+  rm -f "$AUTOHEAL_LOCK_DIR/pid" "$AUTOHEAL_LOCK_DIR/started" 2>/dev/null || true
   rmdir "$AUTOHEAL_LOCK_DIR" 2>/dev/null || true
 }
 

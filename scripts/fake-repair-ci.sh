@@ -187,10 +187,12 @@ need_pattern 'AUTOHEAL_COOLDOWN_SECONDS' bin/codex-gcp-autoheal
 need_pattern 'AUTOHEAL_SOCKET_STORM_COOLDOWN_SECONDS' bin/codex-gcp-autoheal
 need_pattern 'AUTOHEAL_STALE_SOCKET_THRESHOLD' bin/codex-gcp-autoheal
 need_pattern 'AUTOHEAL_ALLOW_APP_SERVER_RESTART' bin/codex-gcp-autoheal
+need_pattern 'active sockets dominate' bin/codex-gcp-autoheal
 need_pattern 'remote_10800_data_plane_repair_remote_sockets' bin/codex-gcp-autoheal
 need_pattern 'reset-socket-storm' bin/codex-gcp-autoheal
 need_pattern 'REPAIR_LOCK_DIR' bin/codex-gcp-autoheal
 need_pattern 'repair_lock_active' bin/codex-gcp-autoheal
+need_pattern 'AUTOHEAL_LOCK_DIR/pid' bin/codex-gcp-autoheal
 need_pattern 'GCP_ENABLED_FILE' bin/codex-gcp-autoheal
 need_pattern 'gcp_intended_on' bin/codex-gcp-autoheal
 need_pattern 'sync_enabled_marker_if_healthy' bin/codex-gcp-autoheal
