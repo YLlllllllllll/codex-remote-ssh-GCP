@@ -604,11 +604,11 @@ smart_reset_cursor_if_needed() {
     output="$("$CURSOR_RESET_SCRIPT" status 2>&1 || true)"
     log "Smart-Repair: Cursor Remote SSH 状态"
     log_inline_output "$output"
-    if ! grep -q 'would terminate Cursor Remote SSH process group' <<< "$output"; then
+    if ! grep -q 'would terminate Cursor Remote SSH process' <<< "$output"; then
         return 0
     fi
 
-    log "Smart-Repair: 发现卡住的 Cursor Remote SSH 进程组, 只重置 Cursor SSH"
+    log "Smart-Repair: 发现卡住的 Cursor Remote SSH 进程或转发, 只重置 Cursor SSH"
     run_with_timeout "$COMMAND_TIMEOUT_SECONDS" "$CURSOR_RESET_SCRIPT" reset
     rc=$?
     if [ "$rc" -eq 0 ]; then

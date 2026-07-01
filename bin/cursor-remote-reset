@@ -159,6 +159,48 @@ cursor_remote_listener_groups() {
     done
 }
 
+cursor_remote_orphan_forward_processes() {
+    local min_age=$1
+    local logs_dir="$LOCAL_HOME/Library/Application Support/Cursor/logs"
+
+    [ -d "$logs_dir" ] || return 0
+
+    {
+    find "$logs_dir" -type f -mtime -2 -name 'Remote - SSH*.log' -print0 2>/dev/null |
+        xargs -0 sed -nE 's/.*127\.0\.0\.1:([0-9]+) -> socks 127\.0\.0\.1:([0-9]+).*/\1 \2/p' 2>/dev/null |
+        sort -u |
+        while read -r forward_port socks_port; do
+            [ -n "$forward_port" ] || continue
+            [ -n "$socks_port" ] || continue
+            if lsof -nP -iTCP:"$socks_port" -sTCP:LISTEN >/dev/null 2>&1; then
+                continue
+            fi
+
+            lsof -nP -iTCP:"$forward_port" -sTCP:LISTEN -Fp 2>/dev/null | sed -n 's/^p//p' | while read -r pid; do
+                local age command
+
+                [ -n "$pid" ] || continue
+                command=$(ps -o command= -p "$pid" 2>/dev/null || true)
+                case "$command" in
+                    *Cursor*Helper*|*Cursor.app*)
+                        ;;
+                    *)
+                        continue
+                        ;;
+                esac
+
+                age=$(process_age_seconds "$pid" || true)
+                [ -n "$age" ] || continue
+                if [ "$age" -lt "$min_age" ]; then
+                    continue
+                fi
+
+                echo "$pid $age cursor_remote_orphan_forward:${forward_port}:missing_socks:${socks_port} $forward_port"
+            done
+        done
+    } || true
+}
+
 process_group_alive() {
     local pgid=$1
 
@@ -168,9 +210,10 @@ process_group_alive() {
 ssh_groups=$(cursor_remote_ssh_groups "$MIN_AGE")
 listener_groups=$(cursor_remote_listener_groups "$ssh_groups" "$MIN_AGE" || true)
 groups=$(printf '%s\n%s\n' "$ssh_groups" "$listener_groups" | awk 'NF && !seen[$1]++')
-if [ -z "$groups" ]; then
-    log "No Cursor Remote SSH process groups found (min_age=${MIN_AGE}s)"
-    [ "$DRY_RUN" = "1" ] && echo "DRY RUN: no Cursor Remote SSH process groups found"
+processes=$(cursor_remote_orphan_forward_processes "$MIN_AGE" | awk 'NF && !seen[$1]++' || true)
+if [ -z "$groups" ] && [ -z "$processes" ]; then
+    log "No Cursor Remote SSH process groups or orphan forwards found (min_age=${MIN_AGE}s)"
+    [ "$DRY_RUN" = "1" ] && echo "DRY RUN: no Cursor Remote SSH process groups or orphan forwards found"
     exit 0
 fi
 
@@ -179,14 +222,23 @@ if [ "$DRY_RUN" = "1" ]; then
         [ -n "$pgid" ] || continue
         echo "DRY RUN: would terminate Cursor Remote SSH process group -${pgid} (pid=${pid}, age=${age}s, reason=${reason})"
     done
+    echo "$processes" | while read -r pid age reason port; do
+        [ -n "$pid" ] || continue
+        echo "DRY RUN: would terminate Cursor Remote SSH process pid=${pid} (age=${age}s, reason=${reason})"
+    done
     exit 0
 fi
 
-log "Resetting Cursor Remote SSH process groups (min_age=${MIN_AGE}s)"
+log "Resetting Cursor Remote SSH process groups/orphan forwards (min_age=${MIN_AGE}s)"
 echo "$groups" | while read -r pgid age pid reason port; do
     [ -n "$pgid" ] || continue
     log "TERM Cursor Remote SSH process group -${pgid} (pid=${pid}, age=${age}s, reason=${reason})"
     kill -TERM "-${pgid}" 2>/dev/null || true
+done
+echo "$processes" | while read -r pid age reason port; do
+    [ -n "$pid" ] || continue
+    log "TERM Cursor Remote SSH process pid=${pid} (age=${age}s, reason=${reason})"
+    kill -TERM "$pid" 2>/dev/null || true
 done
 
 sleep "$KILL_GRACE_SECONDS"
@@ -196,5 +248,12 @@ echo "$groups" | while read -r pgid age pid reason port; do
     if process_group_alive "$pgid"; then
         log "KILL Cursor Remote SSH process group -${pgid} (pid=${pid}, age=${age}s, reason=${reason})"
         kill -KILL "-${pgid}" 2>/dev/null || true
+    fi
+done
+echo "$processes" | while read -r pid age reason port; do
+    [ -n "$pid" ] || continue
+    if kill -0 "$pid" 2>/dev/null; then
+        log "KILL Cursor Remote SSH process pid=${pid} (age=${age}s, reason=${reason})"
+        kill -KILL "$pid" 2>/dev/null || true
     fi
 done

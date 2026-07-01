@@ -68,6 +68,8 @@ need_pattern '^[[:space:]]*-4' bin/codex-workspace-proxy
 need_pattern '^[[:space:]]*-6' bin/codex-workspace-proxy
 need_pattern 'cursor-remote-reset' scripts/install.sh
 need_pattern 'cursor_remote_install' bin/cursor-remote-reset
+need_pattern 'cursor_remote_orphan_forward' bin/cursor-remote-reset
+need_pattern 'would terminate Cursor Remote SSH process' bin/kinit-refresh
 need_pattern 'CURSOR_REMOTE_RESET_MIN_AGE' bin/cursor-remote-reset
 reject_pattern 'codex-gcp-monitor|codex-gcp-remote|kinit-refresh remote-gcp|clean-repair-fast|/Applications/Codex.app' bin/cursor-remote-reset
 need_pattern 'gcp\|remote-gcp\|codex-gcp\|refresh-gcp' bin/kinit-refresh
