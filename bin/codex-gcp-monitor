@@ -454,9 +454,11 @@ capture_incident_if_needed() {
     printf '\n'
   } | section_to_file "$evidence" "local reachability probes"
   {
-    bind_arg=()
-    [[ -n "$gcp_bind" ]] && bind_arg=(-s "$gcp_bind")
-    nc "${bind_arg[@]}" -vz -G "$MONITOR_CONNECT_TIMEOUT" "$GCP_HOST" "$GCP_PORT" 2>&1 || true
+    if [[ -n "$gcp_bind" ]]; then
+      nc -s "$gcp_bind" -vz -G "$MONITOR_CONNECT_TIMEOUT" "$GCP_HOST" "$GCP_PORT" 2>&1 || true
+    else
+      nc -vz -G "$MONITOR_CONNECT_TIMEOUT" "$GCP_HOST" "$GCP_PORT" 2>&1 || true
+    fi
   } | section_to_file "$evidence" "gcp tcp probe"
   {
     ssh -o BatchMode=yes -o ConnectTimeout="$MONITOR_CONNECT_TIMEOUT" -o ConnectionAttempts=1 "$REMOTE_HOST" \
