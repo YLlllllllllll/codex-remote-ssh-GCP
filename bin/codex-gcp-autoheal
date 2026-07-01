@@ -314,6 +314,18 @@ run_once() {
   fi
   log "finish: rc=$rc mode=$AUTOHEAL_REPAIR_MODE"
   "$MONITOR_SCRIPT" sample >/dev/null 2>> "$AUTOHEAL_LOG_FILE" || true
+  local post_status post_cause
+  post_status="$(kv_value STATUS)"
+  post_cause="$(kv_value CAUSE)"
+  if [[ "$post_status" == "fail" ]]; then
+    rm -f "$AUTOHEAL_LAST_FILE" 2>/dev/null || true
+    case "$post_cause" in
+      local_1080_missing|local_7890_missing|local_7890_bad_egress|remote_10800_missing|remote_10800_bad_egress|chatgpt_unreachable_*)
+        rm -f "$AUTOHEAL_SOCKET_STORM_LAST_FILE" 2>/dev/null || true
+        ;;
+    esac
+    log "post-repair monitor still fail: cause=${post_cause:-unknown}; cleared cooldown for next autoheal tick"
+  fi
   release_lock
 
   printf 'autoheal ran: rc=%s\n' "$rc"

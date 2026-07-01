@@ -100,6 +100,9 @@ need_pattern 'clean-repair-fast' bin/codex-gcp-remote
 need_pattern 'deep-repair' bin/codex-gcp-remote
 need_pattern 'sync_remote_codex_version' bin/codex-gcp-remote
 need_pattern 'verify_local_socks_only' bin/codex-gcp-remote
+need_pattern 'curl_code_local_socks' bin/codex-gcp-remote
+need_pattern 'curl_code_local_http' bin/codex-gcp-remote
+need_pattern 'local http chatgpt code' bin/codex-gcp-remote
 need_pattern 'deep_repair_validate_with_recovery' bin/codex-gcp-remote
 need_pattern 'ensure_local_tcp_headroom' bin/codex-gcp-remote
 need_pattern 'CODEX_TCP_MSL' bin/codex-gcp-remote
@@ -172,6 +175,7 @@ need_pattern 'REMOTE_10800_SOCKET_COUNT' bin/codex-gcp-monitor
 need_pattern 'REMOTE_10800_ACTIVE_SOCKET_COUNT' bin/codex-gcp-monitor
 need_pattern 'REMOTE_10800_STALE_SOCKET_COUNT' bin/codex-gcp-monitor
 need_pattern 'gcp_bind_address' bin/codex-gcp-monitor
+need_pattern 'remote_chain_ok' bin/codex-gcp-monitor
 need_pattern 'StartInterval' launchd/com.example.codex-gcp-monitor.plist
 reject_pattern 'kinit-refresh remote-gcp|clean-repair-fast|killall|pkill|launchctl setenv|/Applications/Codex.app' bin/codex-gcp-monitor
 
@@ -192,6 +196,7 @@ need_pattern 'gcp_intended_on' bin/codex-gcp-autoheal
 need_pattern 'sync_enabled_marker_if_healthy' bin/codex-gcp-autoheal
 need_pattern 'cause_autohealable' bin/codex-gcp-autoheal
 need_pattern 'consecutive_fail_count' bin/codex-gcp-autoheal
+need_pattern 'post-repair monitor still fail' bin/codex-gcp-autoheal
 need_pattern 'kinit-refresh' bin/codex-gcp-autoheal
 need_pattern 'codex-gcp-autoheal' scripts/install.sh
 need_pattern 'com.example.codex-gcp-autoheal.plist' scripts/install.sh

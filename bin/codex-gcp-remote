@@ -492,6 +492,21 @@ curl_ip_local_http() {
   curl -sS --connect-timeout 3 --max-time "$IP_CHECK_TIMEOUT" -x "$LOCAL_HTTP_URL" "$IP_CHECK_URL" 2>/dev/null || true
 }
 
+curl_code_local_socks() {
+  ALL_PROXY="$LOCAL_SOCKS_URL" curl -sS -o /dev/null -w '%{http_code}' --connect-timeout 5 --max-time "$IP_CHECK_TIMEOUT" "$CHATGPT_CODEX_URL" 2>/dev/null || true
+}
+
+curl_code_local_http() {
+  curl -sS -o /dev/null -w '%{http_code}' --connect-timeout 5 --max-time "$IP_CHECK_TIMEOUT" -x "$LOCAL_HTTP_URL" "$CHATGPT_CODEX_URL" 2>/dev/null || true
+}
+
+http_code_ok() {
+  case "${1:-}" in
+    2*|3*|4*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 retry_ip_probe() {
   local probe="$1"
   local attempts="${2:-5}"
@@ -509,6 +524,26 @@ retry_ip_probe() {
   done
 
   printf '%s\n' "$ip"
+  return 1
+}
+
+retry_code_probe() {
+  local probe="$1"
+  local attempts="${2:-5}"
+  local delay="${3:-2}"
+  local code=""
+  local i
+
+  for i in $(seq 1 "$attempts"); do
+    code="$("$probe")"
+    if http_code_ok "$code"; then
+      printf '%s\n' "$code"
+      return 0
+    fi
+    sleep "$delay"
+  done
+
+  printf '%s\n' "$code"
   return 1
 }
 
@@ -792,7 +827,7 @@ stop_local_socks_launchd() {
 start_local_socks_launchd() {
   [[ -f "$LOCAL_SOCKS_PLIST" ]] || return 1
 
-  local uid ip
+  local uid ip code
   uid="$(id -u)"
   launchctl bootstrap "gui/$uid" "$LOCAL_SOCKS_PLIST" >/dev/null 2>&1 || true
   launchctl kickstart -k "gui/$uid/$LOCAL_SOCKS_LABEL" >/dev/null 2>&1 || true
@@ -803,11 +838,13 @@ start_local_socks_launchd() {
 
   for _ in $(seq 1 8); do
     ip="$(curl_ip_local_socks)"
-    if [[ "$ip" == "$GCP_EXPECTED_IP" ]]; then
+    code="$(curl_code_local_socks)"
+    if [[ "$ip" == "$GCP_EXPECTED_IP" ]] && http_code_ok "$code"; then
       printf 'local SOCKS LaunchAgent healthy: %s\n' "$LOCAL_SOCKS_LABEL"
       listener_pids "$LOCAL_SOCKS_PORT" | head -n 1 > "$STATE_DIR/gcp-socks.manual.pid"
       lsof -nP -iTCP:"$LOCAL_SOCKS_PORT" -sTCP:LISTEN
       printf 'local socks ip: %s\n' "$ip"
+      printf 'local socks chatgpt code: %s\n' "$code"
       return 0
     fi
     sleep 1
@@ -823,7 +860,9 @@ start_local_socks() {
 
   local existing_ip
   existing_ip="$(retry_ip_probe curl_ip_local_socks 2 1 || true)"
-  if [[ -n "$(listener_pids "$LOCAL_SOCKS_PORT")" && "$existing_ip" == "$GCP_EXPECTED_IP" ]]; then
+  local existing_code
+  existing_code="$(retry_code_probe curl_code_local_socks 2 1 || true)"
+  if [[ -n "$(listener_pids "$LOCAL_SOCKS_PORT")" && "$existing_ip" == "$GCP_EXPECTED_IP" ]] && http_code_ok "$existing_code"; then
     if [[ -f "$LOCAL_SOCKS_PLIST" ]] && ! launchd_loaded "$LOCAL_SOCKS_LABEL"; then
       printf 'local SOCKS is healthy but not launchd-managed; switching to persistent LaunchAgent\n'
       kill_listeners "$LOCAL_SOCKS_PORT"
@@ -837,6 +876,7 @@ start_local_socks() {
     listener_pids "$LOCAL_SOCKS_PORT" | head -n 1 > "$STATE_DIR/gcp-socks.manual.pid"
     lsof -nP -iTCP:"$LOCAL_SOCKS_PORT" -sTCP:LISTEN
     printf 'local socks ip: %s\n' "$existing_ip"
+    printf 'local socks chatgpt code: %s\n' "$existing_code"
     return
   fi
 
@@ -883,11 +923,13 @@ start_local_socks() {
   printf '%s\n' "$pid" > "$STATE_DIR/gcp-socks.manual.pid"
   lsof -nP -iTCP:"$LOCAL_SOCKS_PORT" -sTCP:LISTEN
 
-  local ip
+  local ip code
   ip="$(retry_ip_probe curl_ip_local_socks 5 2 || true)"
+  code="$(retry_code_probe curl_code_local_socks 5 2 || true)"
   printf 'local socks ip: %s\n' "$ip"
-  if [[ "$ip" != "$GCP_EXPECTED_IP" ]]; then
-    printf 'ERROR: local SOCKS egress is %s, expected %s\n' "$ip" "$GCP_EXPECTED_IP" >&2
+  printf 'local socks chatgpt code: %s\n' "$code"
+  if [[ "$ip" != "$GCP_EXPECTED_IP" ]] || ! http_code_ok "$code"; then
+    printf 'ERROR: local SOCKS unhealthy: ip=%s expected=%s chatgpt_code=%s\n' "$ip" "$GCP_EXPECTED_IP" "$code" >&2
     kill_listeners "$LOCAL_SOCKS_PORT"
     exit 1
   fi
@@ -897,13 +939,15 @@ start_local_http() {
   section "Ensure local HTTP ${LOCAL_HTTP_HOST}:${LOCAL_HTTP_PORT}"
   mkdir -p "$STATE_DIR"
 
-  local existing_ip
+  local existing_ip existing_code
   existing_ip="$(retry_ip_probe curl_ip_local_http 2 1 || true)"
-  if [[ -n "$(listener_pids "$LOCAL_HTTP_PORT")" && "$existing_ip" == "$GCP_EXPECTED_IP" ]]; then
+  existing_code="$(retry_code_probe curl_code_local_http 2 1 || true)"
+  if [[ -n "$(listener_pids "$LOCAL_HTTP_PORT")" && "$existing_ip" == "$GCP_EXPECTED_IP" ]] && http_code_ok "$existing_code"; then
     printf 'local HTTP proxy already healthy; reusing existing listener\n'
     listener_pids "$LOCAL_HTTP_PORT" | head -n 1 > "$STATE_DIR/privoxy.manual.pid"
     lsof -nP -iTCP:"$LOCAL_HTTP_PORT" -sTCP:LISTEN
     printf 'local http ip: %s\n' "$existing_ip"
+    printf 'local http chatgpt code: %s\n' "$existing_code"
     return
   fi
 
@@ -936,11 +980,13 @@ EOF
   printf '%s\n' "$pid" > "$STATE_DIR/privoxy.manual.pid"
   lsof -nP -iTCP:"$LOCAL_HTTP_PORT" -sTCP:LISTEN
 
-  local ip
+  local ip code
   ip="$(retry_ip_probe curl_ip_local_http 5 2 || true)"
+  code="$(retry_code_probe curl_code_local_http 5 2 || true)"
   printf 'local http ip: %s\n' "$ip"
-  if [[ "$ip" != "$GCP_EXPECTED_IP" ]]; then
-    printf 'ERROR: local HTTP egress is %s, expected %s\n' "$ip" "$GCP_EXPECTED_IP" >&2
+  printf 'local http chatgpt code: %s\n' "$code"
+  if [[ "$ip" != "$GCP_EXPECTED_IP" ]] || ! http_code_ok "$code"; then
+    printf 'ERROR: local HTTP unhealthy: ip=%s expected=%s chatgpt_code=%s\n' "$ip" "$GCP_EXPECTED_IP" "$code" >&2
     kill_listeners "$LOCAL_HTTP_PORT"
     exit 1
   fi
