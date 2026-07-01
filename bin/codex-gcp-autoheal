@@ -17,16 +17,21 @@ LATEST_FILE="${MONITOR_LATEST_FILE:-$STATE_DIR/monitor-latest.env}"
 MONITOR_LOG_FILE="${MONITOR_LOG_FILE:-$STATE_DIR/monitor.jsonl}"
 AUTOHEAL_LOG_FILE="${AUTOHEAL_LOG_FILE:-$STATE_DIR/autoheal.log}"
 AUTOHEAL_LAST_FILE="${AUTOHEAL_LAST_FILE:-$STATE_DIR/autoheal.last}"
+AUTOHEAL_SOCKET_STORM_LAST_FILE="${AUTOHEAL_SOCKET_STORM_LAST_FILE:-$STATE_DIR/autoheal.socket-storm.last}"
 GCP_ENABLED_FILE="${GCP_ENABLED_FILE:-$STATE_DIR/gcp.enabled}"
 KINIT_SCRIPT="${KINIT_SCRIPT:-$LOCAL_HOME/bin/kinit-refresh}"
 MONITOR_SCRIPT="${MONITOR_SCRIPT:-$LOCAL_HOME/bin/codex-gcp-monitor}"
+REMOTE_SCRIPT="${REMOTE_SCRIPT:-$LOCAL_HOME/bin/codex-gcp-remote}"
 AUTOHEAL_LOCK_DIR="${AUTOHEAL_LOCK_DIR:-$STATE_DIR/autoheal.lock}"
+REPAIR_LOCK_DIR="${REPAIR_LOCK_DIR:-$STATE_DIR/repair.lock}"
 
 CODEX_GCP_AUTOHEAL_ENABLED="${CODEX_GCP_AUTOHEAL_ENABLED:-1}"
 AUTOHEAL_MIN_CONSECUTIVE_FAILS="${AUTOHEAL_MIN_CONSECUTIVE_FAILS:-2}"
 AUTOHEAL_COOLDOWN_SECONDS="${AUTOHEAL_COOLDOWN_SECONDS:-900}"
+AUTOHEAL_SOCKET_STORM_COOLDOWN_SECONDS="${AUTOHEAL_SOCKET_STORM_COOLDOWN_SECONDS:-120}"
 AUTOHEAL_MAX_SAMPLE_AGE_SECONDS="${AUTOHEAL_MAX_SAMPLE_AGE_SECONDS:-300}"
 AUTOHEAL_REPAIR_MODE="${AUTOHEAL_REPAIR_MODE:-remote-gcp}"
+AUTOHEAL_STALE_SOCKET_THRESHOLD="${AUTOHEAL_STALE_SOCKET_THRESHOLD:-20}"
 
 log() {
   mkdir -p "$STATE_DIR"
@@ -138,24 +143,26 @@ consecutive_fail_count() {
 }
 
 cooldown_remaining() {
+  local file="${1:-$AUTOHEAL_LAST_FILE}"
+  local cooldown="${2:-$AUTOHEAL_COOLDOWN_SECONDS}"
   local last now elapsed
-  [[ -f "$AUTOHEAL_LAST_FILE" ]] || {
+  [[ -f "$file" ]] || {
     printf '0\n'
     return
   }
-  last="$(head -n 1 "$AUTOHEAL_LAST_FILE" 2>/dev/null || printf '0')"
+  last="$(head -n 1 "$file" 2>/dev/null || printf '0')"
   last="$(number_or_zero "$last")"
   now="$(date +%s)"
   elapsed=$((now - last))
-  if [[ "$elapsed" -ge "$AUTOHEAL_COOLDOWN_SECONDS" ]]; then
+  if [[ "$elapsed" -ge "$cooldown" ]]; then
     printf '0\n'
   else
-    printf '%s\n' "$((AUTOHEAL_COOLDOWN_SECONDS - elapsed))"
+    printf '%s\n' "$((cooldown - elapsed))"
   fi
 }
 
 should_autoheal() {
-  local status cause fails remaining
+  local status cause fails remaining stale_sockets remote_count local_http_ip
 
   [[ "$CODEX_GCP_AUTOHEAL_ENABLED" == "1" ]] || {
     printf 'skip: autoheal disabled\n'
@@ -172,12 +179,37 @@ should_autoheal() {
 
   status="$(kv_value STATUS)"
   cause="$(kv_value CAUSE)"
-  [[ "$status" == "fail" ]] || {
-    printf 'skip: monitor status %s\n' "${status:-unknown}"
-    return 1
-  }
   gcp_intended_on || {
     printf 'skip: GCP not intended on\n'
+    return 1
+  }
+  stale_sockets="$(number_or_zero "$(kv_value REMOTE_10800_STALE_SOCKET_COUNT)")"
+  remote_count="$(number_or_zero "$(kv_value REMOTE_10800_COUNT)")"
+  local_http_ip="$(kv_value LOCAL_7890_IP)"
+  if [[ "$stale_sockets" -ge "$AUTOHEAL_STALE_SOCKET_THRESHOLD" ]]; then
+    remaining="$(number_or_zero "$(cooldown_remaining "$AUTOHEAL_SOCKET_STORM_LAST_FILE" "$AUTOHEAL_SOCKET_STORM_COOLDOWN_SECONDS")")"
+    if [[ "$remaining" -gt 0 ]]; then
+      printf 'skip: socket-storm cooldown %ss remaining\n' "$remaining"
+      return 1
+    fi
+    printf 'heal: cause=remote_10800_socket_storm stale_sockets=%s threshold=%s\n' "$stale_sockets" "$AUTOHEAL_STALE_SOCKET_THRESHOLD"
+    return 0
+  fi
+  if [[ "$remote_count" -gt 0 && "$local_http_ip" == "${GCP_EXPECTED_IP:-}" ]]; then
+    case "$cause" in
+      remote_10800_bad_egress|chatgpt_unreachable_000|chatgpt_unreachable_empty)
+        remaining="$(number_or_zero "$(cooldown_remaining "$AUTOHEAL_SOCKET_STORM_LAST_FILE" "$AUTOHEAL_SOCKET_STORM_COOLDOWN_SECONDS")")"
+        if [[ "$remaining" -gt 0 ]]; then
+          printf 'skip: socket-storm cooldown %ss remaining\n' "$remaining"
+          return 1
+        fi
+        printf 'heal: cause=remote_10800_data_plane_reset monitor_cause=%s stale_sockets=%s\n' "$cause" "$stale_sockets"
+        return 0
+        ;;
+    esac
+  fi
+  [[ "$status" == "fail" ]] || {
+    printf 'skip: monitor status %s\n' "${status:-unknown}"
     return 1
   }
   cause_autohealable "$cause" || {
@@ -210,6 +242,21 @@ release_lock() {
   rmdir "$AUTOHEAL_LOCK_DIR" 2>/dev/null || true
 }
 
+repair_lock_active() {
+  [[ -d "$REPAIR_LOCK_DIR" ]] || return 1
+
+  local owner_pid
+  owner_pid="$(head -n 1 "$REPAIR_LOCK_DIR/pid" 2>/dev/null || true)"
+  case "$owner_pid" in
+    ''|*[!0-9]*)
+      return 0
+      ;;
+    *)
+      kill -0 "$owner_pid" 2>/dev/null
+      ;;
+  esac
+}
+
 run_once() {
   local decision rc
   sync_enabled_marker_if_healthy
@@ -224,14 +271,29 @@ run_once() {
     printf 'skip: autoheal already running\n'
     return 0
   fi
+  if repair_lock_active; then
+    log "skip: Codex GCP repair already running"
+    printf 'skip: Codex GCP repair already running\n'
+    release_lock
+    return 0
+  fi
 
   printf '%s\n' "$(date +%s)" > "$AUTOHEAL_LAST_FILE"
   log "start: $decision"
   rc=0
-  if "$KINIT_SCRIPT" "$AUTOHEAL_REPAIR_MODE" >> "$AUTOHEAL_LOG_FILE" 2>&1; then
-    rc=0
+  if [[ "$decision" == *"cause=remote_10800_socket_storm"* || "$decision" == *"cause=remote_10800_data_plane_reset"* ]]; then
+    printf '%s\n' "$(date +%s)" > "$AUTOHEAL_SOCKET_STORM_LAST_FILE"
+    if "$REMOTE_SCRIPT" reset-socket-storm >> "$AUTOHEAL_LOG_FILE" 2>&1; then
+      rc=0
+    else
+      rc=$?
+    fi
   else
-    rc=$?
+    if "$KINIT_SCRIPT" "$AUTOHEAL_REPAIR_MODE" >> "$AUTOHEAL_LOG_FILE" 2>&1; then
+      rc=0
+    else
+      rc=$?
+    fi
   fi
   log "finish: rc=$rc mode=$AUTOHEAL_REPAIR_MODE"
   "$MONITOR_SCRIPT" sample >/dev/null 2>> "$AUTOHEAL_LOG_FILE" || true
@@ -245,6 +307,8 @@ status() {
   printf 'enabled=%s\n' "$CODEX_GCP_AUTOHEAL_ENABLED"
   printf 'min_consecutive_failures=%s\n' "$AUTOHEAL_MIN_CONSECUTIVE_FAILS"
   printf 'cooldown_seconds=%s\n' "$AUTOHEAL_COOLDOWN_SECONDS"
+  printf 'socket_storm_cooldown_seconds=%s\n' "$AUTOHEAL_SOCKET_STORM_COOLDOWN_SECONDS"
+  printf 'stale_socket_threshold=%s\n' "$AUTOHEAL_STALE_SOCKET_THRESHOLD"
   printf 'latest_decision=%s\n' "$(should_autoheal 2>/dev/null || true)"
   if [[ -f "$AUTOHEAL_LOG_FILE" ]]; then
     tail -n 20 "$AUTOHEAL_LOG_FILE"
@@ -261,11 +325,13 @@ self_test() {
   MONITOR_LOG_FILE="$tmp/monitor.jsonl"
   AUTOHEAL_LOG_FILE="$tmp/autoheal.log"
   AUTOHEAL_LAST_FILE="$tmp/autoheal.last"
+  AUTOHEAL_SOCKET_STORM_LAST_FILE="$tmp/autoheal.socket-storm.last"
   GCP_ENABLED_FILE="$tmp/gcp.enabled"
   AUTOHEAL_LOCK_DIR="$tmp/autoheal.lock"
   CODEX_GCP_AUTOHEAL_ENABLED=1
   AUTOHEAL_MIN_CONSECUTIVE_FAILS=2
   AUTOHEAL_COOLDOWN_SECONDS=900
+  AUTOHEAL_SOCKET_STORM_COOLDOWN_SECONDS=120
   AUTOHEAL_MAX_SAMPLE_AGE_SECONDS=300
 
   mkdir -p "$tmp"

@@ -67,6 +67,7 @@ GCP_KEY="${GCP_KEY:-$LOCAL_HOME/.ssh/google_compute_engine}"
 GCP_EXPECTED_IP="${GCP_EXPECTED_IP:-192.0.2.10}"
 
 REMOTE_HOST="${REMOTE_HOST:-${SSH_PROBE_TARGET:-remote-workspace.example.invalid}}"
+REMOTE_HOME="${REMOTE_HOME:-/home/remote-user}"
 
 LOCAL_SOCKS_HOST="${LOCAL_SOCKS_HOST:-127.0.0.1}"
 LOCAL_SOCKS_PORT="${LOCAL_SOCKS_PORT:-1080}"
@@ -92,13 +93,21 @@ CODEX_EXEC_CLEAN_MARKER="${CODEX_EXEC_CLEAN_MARKER:-}"
 GCP_TRAFFIC_IFACE="${GCP_TRAFFIC_IFACE:-ens4}"
 GCP_TRAFFIC_SAMPLE_SECONDS="${GCP_TRAFFIC_SAMPLE_SECONDS:-20}"
 GCP_TRAFFIC_LIMIT_BYTES="${GCP_TRAFFIC_LIMIT_BYTES:-10485760}"
+CODEX_TCP_SETTLE_SECONDS="${CODEX_TCP_SETTLE_SECONDS:-12}"
+CODEX_TCP_MSL="${CODEX_TCP_MSL:-1000}"
+CODEX_TCP_PORT_RANGE_FIRST="${CODEX_TCP_PORT_RANGE_FIRST:-10000}"
+CODEX_TCP_PORT_RANGE_LAST="${CODEX_TCP_PORT_RANGE_LAST:-65535}"
+CODEX_REPAIR_LOCK_WAIT_SECONDS="${CODEX_REPAIR_LOCK_WAIT_SECONDS:-180}"
 
 STATE_DIR="${STATE_DIR:-$LOCAL_HOME/.codex-gcp-tunnel}"
+REPAIR_LOCK_DIR="${REPAIR_LOCK_DIR:-$STATE_DIR/repair.lock}"
 PRIVOXY_CONF="$STATE_DIR/privoxy.conf"
 REMOTE_CONTROL_PATH="$STATE_DIR/remote-forward.cm"
 REMOTE_FORWARD_PID_FILE="$STATE_DIR/remote-forward.manual.pid"
 REMOTE_FORWARD_LABEL="${REMOTE_FORWARD_LABEL:-com.example.codex-gcp-forward}"
 REMOTE_FORWARD_PLIST="${REMOTE_FORWARD_PLIST:-$LOCAL_HOME/Library/LaunchAgents/${REMOTE_FORWARD_LABEL}.plist}"
+LOCAL_SOCKS_LABEL="${LOCAL_SOCKS_LABEL:-com.bytedance.codex.gcp-socks}"
+LOCAL_SOCKS_PLIST="${LOCAL_SOCKS_PLIST:-$LOCAL_HOME/Library/LaunchAgents/${LOCAL_SOCKS_LABEL}.plist}"
 DRY_RUN="${CODEX_GCP_DRY_RUN:-0}"
 
 LOCAL_SOCKS_URL="socks5h://${LOCAL_SOCKS_HOST}:${LOCAL_SOCKS_PORT}"
@@ -118,6 +127,18 @@ Commands:
   clean-repair-fast
              Force reset local 1080/7890, remote 10800, stale SSH sessions,
              and remote Codex app-server, then rebuild the fast path.
+  deep-repair
+             One-shot heavy repair: sync remote Codex to local version, stop
+             remote consumers, rebuild 1080/7890/10800, and run openai-ok.
+  cleanup
+             Conservatively clean stale remote workers and drifted app-server
+             state without killing a healthy current Codex app-server.
+  reset-socket-storm
+             Reset remote 10800 and Codex app-server to clear excessive stale
+             socket state, then rebuild the remote forward and verify.
+  debug-fast
+             Snapshot the fixed path, run verify-fast, and only run
+             clean-repair-fast if the fixed path is actually broken.
   stop-egress
              Stop local 1080/7890 GCP data plane without touching Codex.app.
   limit-egress
@@ -188,12 +209,48 @@ EOF
     clean-repair-fast)
       cat <<EOF
 Would:
-  - stop any legacy local GCP SOCKS LaunchAgent if present
   - kill local listeners on ${LOCAL_HTTP_PORT} and ${LOCAL_SOCKS_PORT}
   - cancel/reset remote ${REMOTE_HTTP_PORT} forwards and stale SSH tunnel sessions
   - restart remote Codex app-server processes
   - rebuild local SOCKS, local HTTP, and remote reverse HTTP forwarding
   - clean stale remote codex exec workers older than ${STALE_CODEX_EXEC_MIN_AGE}s
+EOF
+      ;;
+    deep-repair)
+      cat <<EOF
+Would:
+  - compare local and remote Codex CLI versions
+  - install @openai/codex@<local-version> on the remote if versions differ
+  - rewrite remote 10800 wrappers after any npm install
+  - verify local TCP TIME_WAIT headroom sysctls and tune them if passwordless sudo allows it
+  - stop remote 10800 forward and remote Codex app-server/proxy consumers first
+  - reset local ${LOCAL_HTTP_PORT}/${LOCAL_SOCKS_PORT}, wait ${CODEX_TCP_SETTLE_SECONDS}s for TCP pressure to settle
+  - rebuild local SOCKS, local HTTP, and remote reverse HTTP forwarding
+  - run verify-fast and full codex exec openai-ok validation, with one isolated rebuild retry if validation creates a socket storm
+EOF
+      ;;
+    cleanup)
+      cat <<EOF
+Would:
+  - kill only drifted remote app-server/proxy processes using 18080/18081 or .codex-gcp
+  - clean stale remote codex exec workers older than ${STALE_CODEX_EXEC_MIN_AGE}s
+  - summarize remote ${REMOTE_HTTP_PORT} sockets
+EOF
+      ;;
+    reset-socket-storm)
+      cat <<EOF
+Would:
+  - reset remote ${REMOTE_HTTP_PORT} forward and SSH ControlMasters
+  - restart remote Codex app-server/proxy processes
+  - rebuild remote reverse HTTP forwarding and run verify-fast
+EOF
+      ;;
+    debug-fast)
+      cat <<EOF
+Would:
+  - snapshot listeners, local proxy egress, monitor state, and remote ${REMOTE_HTTP_PORT} sockets
+  - run verify-fast
+  - run clean-repair-fast only if verify-fast fails
 EOF
       ;;
     stop-egress)
@@ -239,6 +296,65 @@ section() {
   printf '\n== %s ==\n' "$1"
 }
 
+release_repair_lock() {
+  rm -f "$REPAIR_LOCK_DIR/pid" "$REPAIR_LOCK_DIR/cmd" "$REPAIR_LOCK_DIR/started" 2>/dev/null || true
+  rmdir "$REPAIR_LOCK_DIR" 2>/dev/null || true
+}
+
+clear_stale_repair_lock_if_needed() {
+  [[ -d "$REPAIR_LOCK_DIR" ]] || return 1
+
+  local owner_pid
+  owner_pid="$(head -n 1 "$REPAIR_LOCK_DIR/pid" 2>/dev/null || true)"
+  case "$owner_pid" in
+    ''|*[!0-9]*)
+      ;;
+    *)
+      if kill -0 "$owner_pid" 2>/dev/null; then
+        return 1
+      fi
+      ;;
+  esac
+
+  rm -f "$REPAIR_LOCK_DIR/pid" "$REPAIR_LOCK_DIR/cmd" "$REPAIR_LOCK_DIR/started" 2>/dev/null || true
+  rmdir "$REPAIR_LOCK_DIR" 2>/dev/null || true
+}
+
+acquire_repair_lock() {
+  local lock_cmd="$1" waited step owner
+  waited=0
+  step=2
+  mkdir -p "$STATE_DIR"
+
+  while ! mkdir "$REPAIR_LOCK_DIR" 2>/dev/null; do
+    clear_stale_repair_lock_if_needed && continue
+    if [[ "$waited" -ge "$CODEX_REPAIR_LOCK_WAIT_SECONDS" ]]; then
+      owner="$(cat "$REPAIR_LOCK_DIR/cmd" 2>/dev/null || true)"
+      printf 'ERROR: another Codex GCP repair is still running: %s\n' "${owner:-unknown}" >&2
+      printf 'ERROR: lock wait exceeded %ss: %s\n' "$CODEX_REPAIR_LOCK_WAIT_SECONDS" "$REPAIR_LOCK_DIR" >&2
+      return 1
+    fi
+    sleep "$step"
+    waited=$((waited + step))
+  done
+
+  printf '%s\n' "$$" > "$REPAIR_LOCK_DIR/pid"
+  printf '%s\n' "$lock_cmd" > "$REPAIR_LOCK_DIR/cmd"
+  date '+%Y-%m-%d %H:%M:%S' > "$REPAIR_LOCK_DIR/started"
+  trap release_repair_lock EXIT
+}
+
+command_requires_repair_lock() {
+  case "${1:-}" in
+    repair|repair-fast|clean-repair-fast|deep-repair|cleanup|reset-socket-storm|debug-fast|stop-egress|limit-egress|clean-workers|verify|verify-fast)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 have() {
   command -v "$1" >/dev/null 2>&1
 }
@@ -277,6 +393,13 @@ kill_listeners() {
     kill $pids 2>/dev/null || true
     sleep 1
   fi
+}
+
+launchd_loaded() {
+  local label="$1"
+  local uid
+  uid="$(id -u)"
+  launchctl print "gui/$uid/$label" >/dev/null 2>&1
 }
 
 curl_ip_direct() {
@@ -576,10 +699,43 @@ start_dedicated_remote_forward() {
 }
 
 stop_local_launchd_if_present() {
+  # Kept for old call sites. The persistent SOCKS LaunchAgent should normally
+  # stay loaded so transient GCP SSH failures do not leave only a one-shot tunnel.
+  :
+}
+
+stop_local_socks_launchd() {
   local uid
   uid="$(id -u)"
-  launchctl bootout "gui/$uid" "$LOCAL_HOME/Library/LaunchAgents/com.example.codex.gcp-socks.plist" 2>/dev/null || true
-  launchctl remove com.example.codex.gcp-socks 2>/dev/null || true
+  launchctl bootout "gui/$uid" "$LOCAL_SOCKS_PLIST" >/dev/null 2>&1 || true
+  launchctl remove "$LOCAL_SOCKS_LABEL" >/dev/null 2>&1 || true
+}
+
+start_local_socks_launchd() {
+  [[ -f "$LOCAL_SOCKS_PLIST" ]] || return 1
+
+  local uid ip
+  uid="$(id -u)"
+  launchctl bootstrap "gui/$uid" "$LOCAL_SOCKS_PLIST" >/dev/null 2>&1 || true
+  launchctl kickstart -k "gui/$uid/$LOCAL_SOCKS_LABEL" >/dev/null 2>&1 || true
+
+  if ! launchd_loaded "$LOCAL_SOCKS_LABEL"; then
+    return 1
+  fi
+
+  for _ in $(seq 1 8); do
+    ip="$(curl_ip_local_socks)"
+    if [[ "$ip" == "$GCP_EXPECTED_IP" ]]; then
+      printf 'local SOCKS LaunchAgent healthy: %s\n' "$LOCAL_SOCKS_LABEL"
+      listener_pids "$LOCAL_SOCKS_PORT" | head -n 1 > "$STATE_DIR/gcp-socks.manual.pid"
+      lsof -nP -iTCP:"$LOCAL_SOCKS_PORT" -sTCP:LISTEN
+      printf 'local socks ip: %s\n' "$ip"
+      return 0
+    fi
+    sleep 1
+  done
+
+  return 1
 }
 
 start_local_socks() {
@@ -590,6 +746,15 @@ start_local_socks() {
   local existing_ip
   existing_ip="$(retry_ip_probe curl_ip_local_socks 2 1 || true)"
   if [[ -n "$(listener_pids "$LOCAL_SOCKS_PORT")" && "$existing_ip" == "$GCP_EXPECTED_IP" ]]; then
+    if [[ -f "$LOCAL_SOCKS_PLIST" ]] && ! launchd_loaded "$LOCAL_SOCKS_LABEL"; then
+      printf 'local SOCKS is healthy but not launchd-managed; switching to persistent LaunchAgent\n'
+      kill_listeners "$LOCAL_SOCKS_PORT"
+      if start_local_socks_launchd; then
+        return
+      fi
+      printf 'WARNING: local SOCKS LaunchAgent did not become healthy; falling back to manual ssh\n' >&2
+      stop_local_socks_launchd
+    fi
     printf 'local SOCKS already healthy; reusing existing listener\n'
     listener_pids "$LOCAL_SOCKS_PORT" | head -n 1 > "$STATE_DIR/gcp-socks.manual.pid"
     lsof -nP -iTCP:"$LOCAL_SOCKS_PORT" -sTCP:LISTEN
@@ -598,6 +763,14 @@ start_local_socks() {
   fi
 
   kill_listeners "$LOCAL_SOCKS_PORT"
+
+  if start_local_socks_launchd; then
+    return
+  fi
+  if [[ -f "$LOCAL_SOCKS_PLIST" ]]; then
+    printf 'WARNING: local SOCKS LaunchAgent did not become healthy; falling back to manual ssh\n' >&2
+    stop_local_socks_launchd
+  fi
 
   local -a extra_opts=()
   [[ -n "$GCP_SSH_KEX_ALGORITHMS" ]] && extra_opts+=(-o "KexAlgorithms=$GCP_SSH_KEX_ALGORITHMS")
@@ -1061,6 +1234,161 @@ fi
 REMOTE
 }
 
+remote_socket_summary() {
+  section "Remote 10800 socket summary"
+  ssh_remote "REMOTE_HTTP_PORT=$(shell_quote "$REMOTE_HTTP_PORT") bash -s" <<'REMOTE' || true
+set -Eeuo pipefail
+
+printf 'listeners:\n'
+ss -ltnp 2>/dev/null | awk -v port="$REMOTE_HTTP_PORT" '$4 ~ ":" port "$" { print }' || true
+
+printf '\nsocket states:\n'
+ss -tnp 2>/dev/null | awk -v port="$REMOTE_HTTP_PORT" '
+  $4 ~ ":" port "$" || $5 ~ ":" port "$" {
+    state[$1]++
+    total++
+  }
+  END {
+    printf "TOTAL=%d\n", total + 0
+    for (s in state) {
+      printf "%s=%d\n", s, state[s]
+    }
+  }
+'
+
+printf '\napp-server processes:\n'
+ps -eo pid=,ppid=,etimes=,args= 2>/dev/null | awk '
+  /codex app-server proxy|app-server --listen unix:\/\// {
+    if ($0 !~ /awk /) {
+      print
+    }
+  }
+' || true
+REMOTE
+}
+
+local_tcp_state_summary() {
+  section "Local TCP pressure summary"
+  printf 'all TCP states:\n'
+  netstat -an -p tcp 2>/dev/null | awk 'NR>2 && $6 != "" { c[$6]++ } END { for (s in c) print s, c[s] }' | sort || true
+
+  printf '\nlocal %s/%s TCP states:\n' "$LOCAL_SOCKS_PORT" "$LOCAL_HTTP_PORT"
+  netstat -an -p tcp 2>/dev/null | awk -v socks=".$LOCAL_SOCKS_PORT" -v http=".$LOCAL_HTTP_PORT" '
+    $4 ~ socks "$" || $5 ~ socks "$" || $4 ~ http "$" || $5 ~ http "$" { c[$6]++ }
+    END { for (s in c) print s, c[s] }
+  ' | sort || true
+}
+
+sysctl_value() {
+  local key="$1"
+  sysctl -n "$key" 2>/dev/null || true
+}
+
+apply_sysctl_if_needed() {
+  local key="$1" want="$2" have=""
+  have="$(sysctl_value "$key")"
+  printf '%s=%s target=%s\n' "$key" "${have:-unknown}" "$want"
+
+  if [[ -z "$want" || "$have" == "$want" ]]; then
+    return 0
+  fi
+
+  if [[ "$(id -u)" == "0" ]]; then
+    sysctl -w "$key=$want" >/dev/null 2>&1 || printf 'WARNING: failed to set %s=%s\n' "$key" "$want" >&2
+    return 0
+  fi
+  if sudo -n true 2>/dev/null; then
+    sudo sysctl -w "$key=$want" >/dev/null 2>&1 || printf 'WARNING: failed to set %s=%s\n' "$key" "$want" >&2
+    return 0
+  fi
+
+  printf 'WARNING: %s is %s, expected %s; passwordless sudo unavailable, leaving current value\n' \
+    "$key" "${have:-unknown}" "$want" >&2
+}
+
+ensure_local_tcp_headroom() {
+  section "Ensure local TCP TIME_WAIT headroom"
+  apply_sysctl_if_needed net.inet.tcp.msl "$CODEX_TCP_MSL"
+  apply_sysctl_if_needed net.inet.ip.portrange.first "$CODEX_TCP_PORT_RANGE_FIRST"
+  apply_sysctl_if_needed net.inet.ip.portrange.hifirst "$CODEX_TCP_PORT_RANGE_FIRST"
+  apply_sysctl_if_needed net.inet.ip.portrange.last "$CODEX_TCP_PORT_RANGE_LAST"
+  apply_sysctl_if_needed net.inet.ip.portrange.hilast "$CODEX_TCP_PORT_RANGE_LAST"
+}
+
+wait_for_local_tcp_settle() {
+  case "$CODEX_TCP_SETTLE_SECONDS" in
+    ''|*[!0-9]*) CODEX_TCP_SETTLE_SECONDS=12 ;;
+  esac
+  if [[ "$CODEX_TCP_SETTLE_SECONDS" -gt 0 ]]; then
+    section "Let local TCP pressure settle (${CODEX_TCP_SETTLE_SECONDS}s)"
+    sleep "$CODEX_TCP_SETTLE_SECONDS"
+  fi
+}
+
+verify_local_socks_only() {
+  section "Validate isolated local SOCKS ${LOCAL_SOCKS_HOST}:${LOCAL_SOCKS_PORT}"
+  local ip code
+  ip="$(retry_ip_probe curl_ip_local_socks 5 2 || true)"
+  printf 'local socks ip: %s\n' "$ip"
+  if [[ "$ip" != "$GCP_EXPECTED_IP" ]]; then
+    printf 'ERROR: local SOCKS egress is %s, expected %s\n' "$ip" "$GCP_EXPECTED_IP" >&2
+    return 1
+  fi
+
+  code="$(ALL_PROXY="$LOCAL_SOCKS_URL" curl -sS -o /dev/null -w '%{http_code}' --connect-timeout 5 --max-time "$IP_CHECK_TIMEOUT" "$CHATGPT_CODEX_URL" 2>/dev/null || true)"
+  printf 'local socks chatgpt code: %s\n' "$code"
+  case "$code" in
+    2*|3*|4*) return 0 ;;
+    *)
+      printf 'ERROR: local SOCKS cannot reach ChatGPT Codex endpoint, code=%s\n' "$code" >&2
+      return 1
+      ;;
+  esac
+}
+
+local_codex_version() {
+  command -v codex >/dev/null 2>&1 || return 1
+  codex --version 2>/dev/null | awk '$1 == "codex-cli" { print $2; exit }'
+}
+
+remote_codex_version() {
+  ssh_remote "codex --version 2>/dev/null | awk '\$1 == \"codex-cli\" { print \$2; exit }'" || true
+}
+
+sync_remote_codex_version() {
+  section "Sync remote Codex CLI version"
+  local local_version remote_version
+  local_version="$(local_codex_version || true)"
+  remote_version="$(remote_codex_version || true)"
+  printf 'local codex version:  %s\n' "${local_version:-unknown}"
+  printf 'remote codex version: %s\n' "${remote_version:-unknown}"
+
+  if [[ -z "$local_version" ]]; then
+    printf 'WARNING: local codex version unavailable; skipping remote version sync\n' >&2
+    return 0
+  fi
+  if [[ "$remote_version" == "$local_version" ]]; then
+    printf 'remote Codex already matches local version\n'
+    return 0
+  fi
+
+  printf 'installing remote @openai/codex@%s under %s/.local/node\n' "$local_version" "$REMOTE_HOME"
+  ssh_remote "LOCAL_CODEX_VERSION=$(shell_quote "$local_version") REMOTE_HOME=$(shell_quote "$REMOTE_HOME") bash -s" <<'REMOTE'
+set -Eeuo pipefail
+
+mkdir -p "$REMOTE_HOME/.local/node"
+npm install -g "@openai/codex@$LOCAL_CODEX_VERSION" --prefix "$REMOTE_HOME/.local/node"
+REMOTE
+  write_remote_wrappers
+}
+
+stop_remote_consumers_for_isolated_rebuild() {
+  section "Stop remote consumers before local proxy reset"
+  force_reset_remote_proxy
+  restart_remote_codex_app_server
+  remote_socket_summary
+}
+
 start_remote_forward() {
   section "Ensure remote HTTP ${REMOTE_HTTP_HOST}:${REMOTE_HTTP_PORT}"
   mkdir -p "$STATE_DIR"
@@ -1156,6 +1484,19 @@ diagnose() {
   tail -80 "$STATE_DIR/gcp-socks.manual.log" "$STATE_DIR/remote-forward.manual.log" "$STATE_DIR/privoxy-runtime.log" 2>/dev/null || true
 }
 
+cleanup_extra() {
+  section "Conservative cleanup"
+  kill_stale_remote_processes
+  clean_stale_remote_codex_exec
+  remote_socket_summary
+
+  if [[ -x "$LOCAL_HOME/bin/codex-gcp-monitor" ]]; then
+    section "Monitor sample after cleanup"
+    "$LOCAL_HOME/bin/codex-gcp-monitor" sample || true
+    "$LOCAL_HOME/bin/codex-gcp-monitor" status || true
+  fi
+}
+
 repair() {
   stop_local_launchd_if_present
   start_local_socks
@@ -1192,6 +1533,108 @@ clean_repair_fast() {
   printf 'Run fast validation with: %s verify-fast\n' "$(basename "$0")"
 }
 
+reset_socket_storm() {
+  force_reset_remote_proxy
+  restart_remote_codex_app_server
+  SKIP_REMOTE_PLAIN_CHECK=1
+  start_remote_forward
+  verify_fast
+  remote_socket_summary
+}
+
+debug_snapshot() {
+  section "Fast debug snapshot"
+  printf 'GCP route: iface=%s gateway=%s bind=%s\n' \
+    "$(route_field "$GCP_HOST" interface || true)" \
+    "$(route_field "$GCP_HOST" gateway || true)" \
+    "$(gcp_bind_address || true)"
+
+  printf '\nlocal listeners:\n'
+  lsof -nP -iTCP:"$LOCAL_SOCKS_PORT" -sTCP:LISTEN || true
+  lsof -nP -iTCP:"$LOCAL_HTTP_PORT" -sTCP:LISTEN || true
+
+  printf '\nlocal egress:\n'
+  printf 'via 1080: %s\n' "$(curl_ip_local_socks)"
+  printf 'via 7890: %s\n' "$(curl_ip_local_http)"
+
+  if [[ -x "$LOCAL_HOME/bin/codex-gcp-monitor" ]]; then
+    section "Monitor sample"
+    "$LOCAL_HOME/bin/codex-gcp-monitor" sample || true
+    "$LOCAL_HOME/bin/codex-gcp-monitor" status || true
+  fi
+
+  remote_socket_summary
+  local_tcp_state_summary
+}
+
+debug_fast() {
+  debug_snapshot
+  if verify_fast; then
+    cleanup_extra
+    return 0
+  fi
+
+  section "Fast path broken; running clean repair"
+  clean_repair_fast
+  verify_fast
+  cleanup_extra
+}
+
+deep_repair_validate_with_recovery() {
+  section "Final validation with one isolated recovery"
+  local rc
+  rc=0
+
+  if verify_fast; then
+    wait_for_local_tcp_settle
+    if verify; then
+      return 0
+    fi
+    rc=$?
+  else
+    rc=$?
+  fi
+
+  section "Final validation failed; rebuild isolated chain and retry"
+  printf 'initial validation exit code: %s\n' "$rc"
+  remote_socket_summary
+  local_tcp_state_summary
+
+  stop_remote_consumers_for_isolated_rebuild
+  force_reset_local_proxy
+  wait_for_local_tcp_settle
+  start_local_socks
+  verify_local_socks_only
+  start_local_http
+  clean_stale_remote_codex_exec
+  SKIP_REMOTE_PLAIN_CHECK=1
+  start_remote_forward
+  wait_for_local_tcp_settle
+  verify_fast
+  wait_for_local_tcp_settle
+  verify
+}
+
+deep_repair() {
+  section "Deep one-shot Codex GCP repair"
+  local_tcp_state_summary
+  ensure_local_tcp_headroom
+  sync_remote_codex_version
+  ensure_remote_wrappers
+  stop_remote_consumers_for_isolated_rebuild
+  force_reset_local_proxy
+  wait_for_local_tcp_settle
+  start_local_socks
+  verify_local_socks_only
+  start_local_http
+  clean_stale_remote_codex_exec
+  SKIP_REMOTE_PLAIN_CHECK=1
+  start_remote_forward
+  deep_repair_validate_with_recovery
+  remote_socket_summary
+  local_tcp_state_summary
+}
+
 verify_fast() {
   section "Fast remote GCP validation"
   local out rc
@@ -1224,7 +1667,7 @@ esac
   printf '%s\n' "$out"
   if [[ "$rc" -ne 0 ]]; then
     printf 'ERROR: fast remote GCP validation failed with %s\n' "$rc" >&2
-    exit "$rc"
+    return "$rc"
   fi
 }
 
@@ -1260,14 +1703,25 @@ for _ in \$(seq 1 '$VERIFY_FAST_ATTEMPTS'); do
 done
 printf '%s\n' \"\$code\"
 case \"\$code\" in
-  2*|3*|4*) exit 0 ;;
+  2*|3*|4*) ;;
   *) exit 1 ;;
 esac
+printf '\n== codex exec openai-ok ==\n'
+cd '$REMOTE_HOME'
+codex_rc=0
+if command -v timeout >/dev/null 2>&1; then
+  codex_out=\"\$(timeout 90s codex exec --skip-git-repo-check --ephemeral --dangerously-bypass-approvals-and-sandbox 'Reply with exactly: openai-ok' 2>&1)\" || codex_rc=\$?
+else
+  codex_out=\"\$(codex exec --skip-git-repo-check --ephemeral --dangerously-bypass-approvals-and-sandbox 'Reply with exactly: openai-ok' 2>&1)\" || codex_rc=\$?
+fi
+printf '%s\n' \"\$codex_out\"
+[ \"\$codex_rc\" -eq 0 ]
+printf '%s\n' \"\$codex_out\" | grep -q 'openai-ok'
 " 2>&1)" || rc=$?
   printf '%s\n' "$out"
   if [[ "$rc" -ne 0 ]]; then
     printf 'ERROR: final Codex endpoint validation exited with %s\n' "$rc" >&2
-    exit "$rc"
+    return "$rc"
   fi
 }
 
@@ -1286,10 +1740,13 @@ set -- "${args[@]}"
 
 cmd="${1:-}"
 case "$cmd" in
-  repair|repair-fast|clean-repair-fast|stop-egress|limit-egress|clean-workers|traffic-sample|diagnose|status|verify|verify-fast)
+  repair|repair-fast|clean-repair-fast|deep-repair|cleanup|reset-socket-storm|debug-fast|stop-egress|limit-egress|clean-workers|traffic-sample|diagnose|status|verify|verify-fast)
     if [[ "$DRY_RUN" == "1" ]]; then
       dry_run_plan "$cmd" "${2:-}"
       exit 0
+    fi
+    if command_requires_repair_lock "$cmd"; then
+      acquire_repair_lock "$cmd"
     fi
     ;;
 esac
@@ -1306,6 +1763,18 @@ case "$cmd" in
     ;;
   clean-repair-fast)
     clean_repair_fast
+    ;;
+  deep-repair)
+    deep_repair
+    ;;
+  cleanup)
+    cleanup_extra
+    ;;
+  reset-socket-storm)
+    reset_socket_storm
+    ;;
+  debug-fast)
+    debug_fast
     ;;
   stop-egress)
     stop_gcp_egress

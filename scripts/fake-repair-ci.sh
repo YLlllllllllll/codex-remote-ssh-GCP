@@ -78,7 +78,21 @@ need_pattern 'stop_codex_gcp_egress' bin/kinit-refresh
 need_pattern 'mark_gcp_enabled' bin/kinit-refresh
 need_pattern 'mark_gcp_disabled' bin/kinit-refresh
 need_pattern 'verify_codex_chain_clean_fast' bin/kinit-refresh
+need_pattern 'deep-repair' bin/kinit-refresh
 need_pattern 'clean-repair-fast' bin/codex-gcp-remote
+need_pattern 'deep-repair' bin/codex-gcp-remote
+need_pattern 'sync_remote_codex_version' bin/codex-gcp-remote
+need_pattern 'verify_local_socks_only' bin/codex-gcp-remote
+need_pattern 'deep_repair_validate_with_recovery' bin/codex-gcp-remote
+need_pattern 'ensure_local_tcp_headroom' bin/codex-gcp-remote
+need_pattern 'CODEX_TCP_MSL' bin/codex-gcp-remote
+need_pattern 'CODEX_TCP_PORT_RANGE_FIRST' bin/codex-gcp-remote
+need_pattern 'CODEX_REPAIR_LOCK_WAIT_SECONDS' bin/codex-gcp-remote
+need_pattern 'acquire_repair_lock' bin/codex-gcp-remote
+need_pattern 'command_requires_repair_lock' bin/codex-gcp-remote
+need_pattern 'local_tcp_state_summary' bin/codex-gcp-remote
+need_pattern 'remote_socket_summary' bin/codex-gcp-remote
+need_pattern 'openai-ok' bin/codex-gcp-remote
 need_pattern 'stop-egress' bin/codex-gcp-remote
 need_pattern 'limit-egress' bin/codex-gcp-remote
 need_pattern 'clean-workers' bin/codex-gcp-remote
@@ -129,6 +143,9 @@ need_pattern 'TRAFFIC_STATUS' bin/codex-gcp-monitor
 need_pattern 'active-sessions.txt' bin/codex-gcp-monitor
 need_pattern 'REMOTE_CODEX_EXEC_COUNT' bin/codex-gcp-monitor
 need_pattern 'REMOTE_10800_SOCKET_COUNT' bin/codex-gcp-monitor
+need_pattern 'REMOTE_10800_ACTIVE_SOCKET_COUNT' bin/codex-gcp-monitor
+need_pattern 'REMOTE_10800_STALE_SOCKET_COUNT' bin/codex-gcp-monitor
+need_pattern 'gcp_bind_address' bin/codex-gcp-monitor
 need_pattern 'StartInterval' launchd/com.example.codex-gcp-monitor.plist
 reject_pattern 'kinit-refresh remote-gcp|clean-repair-fast|killall|pkill|launchctl setenv|/Applications/Codex.app' bin/codex-gcp-monitor
 
@@ -137,6 +154,11 @@ need_pattern 'codex-gcp-autoheal \[run\|status\|self-test\]' bin/codex-gcp-autoh
 need_pattern 'CODEX_GCP_AUTOHEAL_ENABLED' bin/codex-gcp-autoheal
 need_pattern 'AUTOHEAL_MIN_CONSECUTIVE_FAILS' bin/codex-gcp-autoheal
 need_pattern 'AUTOHEAL_COOLDOWN_SECONDS' bin/codex-gcp-autoheal
+need_pattern 'AUTOHEAL_SOCKET_STORM_COOLDOWN_SECONDS' bin/codex-gcp-autoheal
+need_pattern 'AUTOHEAL_STALE_SOCKET_THRESHOLD' bin/codex-gcp-autoheal
+need_pattern 'reset-socket-storm' bin/codex-gcp-autoheal
+need_pattern 'REPAIR_LOCK_DIR' bin/codex-gcp-autoheal
+need_pattern 'repair_lock_active' bin/codex-gcp-autoheal
 need_pattern 'GCP_ENABLED_FILE' bin/codex-gcp-autoheal
 need_pattern 'gcp_intended_on' bin/codex-gcp-autoheal
 need_pattern 'sync_enabled_marker_if_healthy' bin/codex-gcp-autoheal

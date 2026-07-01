@@ -57,6 +57,18 @@ route_field() {
   route -n get "$target" 2>/dev/null | awk -v f="$field" '$1 == f ":" { print $2; exit }'
 }
 
+gcp_bind_address() {
+  if [[ -n "${GCP_BIND_ADDRESS:-}" ]]; then
+    printf '%s\n' "$GCP_BIND_ADDRESS"
+    return 0
+  fi
+
+  local iface
+  iface="$(route_field "$GCP_HOST" interface)"
+  [[ -n "$iface" && "$iface" != utun* ]] || return 0
+  ifconfig "$iface" 2>/dev/null | awk '$1 == "inet" { print $2; exit }'
+}
+
 listener_pids() {
   local port="$1"
   { lsof -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null || true; } | paste -sd, -
@@ -79,7 +91,13 @@ curl_local_http_ip() {
 }
 
 tcp_check() {
-  nc -vz -G "$MONITOR_CONNECT_TIMEOUT" "$GCP_HOST" "$GCP_PORT" >/dev/null 2>&1 && printf ok || printf fail
+  local bind_address
+  bind_address="$(gcp_bind_address)"
+  if [[ -n "$bind_address" ]]; then
+    nc -s "$bind_address" -vz -G "$MONITOR_CONNECT_TIMEOUT" "$GCP_HOST" "$GCP_PORT" >/dev/null 2>&1 && printf ok || printf fail
+  else
+    nc -vz -G "$MONITOR_CONNECT_TIMEOUT" "$GCP_HOST" "$GCP_PORT" >/dev/null 2>&1 && printf ok || printf fail
+  fi
 }
 
 gcp_counter_probe() {
@@ -87,6 +105,9 @@ gcp_counter_probe() {
   [[ -n "$GCP_SSH_KEX_ALGORITHMS" ]] && extra_opts+=(-o "KexAlgorithms=$GCP_SSH_KEX_ALGORITHMS")
   [[ -n "$GCP_SSH_HOST_KEY_ALGORITHMS" ]] && extra_opts+=(-o "HostKeyAlgorithms=$GCP_SSH_HOST_KEY_ALGORITHMS")
   [[ -n "$GCP_SSH_CIPHERS" ]] && extra_opts+=(-o "Ciphers=$GCP_SSH_CIPHERS")
+  local bind_address
+  bind_address="$(gcp_bind_address)"
+  [[ -n "$bind_address" ]] && extra_opts+=(-b "$bind_address")
 
   ssh \
     -i "$GCP_KEY" \
@@ -270,6 +291,8 @@ remote_probe() {
 set -u
 listen_count="$(ss -ltn 2>/dev/null | awk -v port="$REMOTE_HTTP_PORT" '$4 ~ ":" port "$" { count++ } END { print count + 0 }')"
 socket_count="$(ss -tnp 2>/dev/null | awk -v port="$REMOTE_HTTP_PORT" '$4 ~ ":" port "$" || $5 ~ ":" port "$" { count++ } END { print count + 0 }')"
+active_socket_count="$(ss -tnp 2>/dev/null | awk -v port="$REMOTE_HTTP_PORT" '($4 ~ ":" port "$" || $5 ~ ":" port "$") && ($1 == "ESTAB" || $1 ~ /^SYN-/) { count++ } END { print count + 0 }')"
+stale_socket_count="$(ss -tnp 2>/dev/null | awk -v port="$REMOTE_HTTP_PORT" '($4 ~ ":" port "$" || $5 ~ ":" port "$") && ($1 == "CLOSE-WAIT" || $1 ~ /^FIN-WAIT/ || $1 == "LAST-ACK" || $1 == "CLOSING" || $1 == "TIME-WAIT") { count++ } END { print count + 0 }')"
 proxy_ip="$(curl -sS --connect-timeout "$MONITOR_CONNECT_TIMEOUT" --max-time "$MONITOR_MAX_TIME" -x "$REMOTE_HTTP_URL" "$IP_CHECK_URL" 2>/dev/null || true)"
 chatgpt_code="$(curl -sS -o /dev/null -w '%{http_code}' --connect-timeout "$MONITOR_CONNECT_TIMEOUT" --max-time "$MONITOR_MAX_TIME" -x "$REMOTE_HTTP_URL" "$CHATGPT_CODEX_URL" 2>/dev/null || true)"
 app_server_count="$(ps -eo args= 2>/dev/null | grep -E 'codex app-server proxy|app-server --listen unix://' | grep -v grep | wc -l | tr -d ' ')"
@@ -289,6 +312,8 @@ session_lines="$(ps -eo pid=,ppid=,etimes=,etime=,pcpu=,pmem=,args= 2>/dev/null 
 codex_exec_count="$(printf '%s\n' "$session_lines" | awk 'NF { count++ } END { print count + 0 }')"
 printf 'REMOTE_LISTEN=%s\n' "$listen_count"
 printf 'REMOTE_10800_SOCKET_COUNT=%s\n' "$socket_count"
+printf 'REMOTE_10800_ACTIVE_SOCKET_COUNT=%s\n' "$active_socket_count"
+printf 'REMOTE_10800_STALE_SOCKET_COUNT=%s\n' "$stale_socket_count"
 printf 'REMOTE_PROXY_IP=%s\n' "$proxy_ip"
 printf 'CHATGPT_CODE=%s\n' "$chatgpt_code"
 printf 'REMOTE_APP_SERVER_COUNT=%s\n' "$app_server_count"
@@ -319,10 +344,10 @@ rotate_if_needed() {
 sample() {
   rotate_if_needed
 
-  local ts epoch default_iface default_gateway gcp_iface gcp_gateway
+  local ts epoch default_iface default_gateway gcp_iface gcp_gateway gcp_bind
   local socks_count http_count socks_pids http_pids local_http_ip gcp_tcp
   local remote_rc remote_output remote_error remote_err_file remote_listen remote_proxy_ip chatgpt_code remote_app_count remote_notty_count
-  local remote_10800_socket_count remote_codex_exec_count remote_session_detail
+  local remote_10800_socket_count remote_10800_active_socket_count remote_10800_stale_socket_count remote_codex_exec_count remote_session_detail
   local status cause status_file_status status_file_message
   local gcp_counter_output gcp_rx_bytes gcp_tx_bytes gcp_counter_ok traffic_today_bytes traffic_24h_bytes traffic_rate_bytes_per_sec traffic_status
   local traffic_today_human traffic_24h_human traffic_rate_human today_start_epoch yesterday_epoch
@@ -335,6 +360,7 @@ sample() {
   default_gateway="$(route_field default gateway || true)"
   gcp_iface="$(route_field "$GCP_HOST" interface || true)"
   gcp_gateway="$(route_field "$GCP_HOST" gateway || true)"
+  gcp_bind="$(gcp_bind_address || true)"
   socks_count="$(listener_count "$LOCAL_SOCKS_PORT")"
   http_count="$(listener_count "$LOCAL_HTTP_PORT")"
   socks_pids="$(listener_pids "$LOCAL_SOCKS_PORT")"
@@ -378,6 +404,8 @@ sample() {
   rm -f "$remote_err_file" 2>/dev/null || true
   remote_listen="$(awk -F= '$1=="REMOTE_LISTEN" {print $2; exit}' <<<"$remote_output")"
   remote_10800_socket_count="$(awk -F= '$1=="REMOTE_10800_SOCKET_COUNT" {print $2; exit}' <<<"$remote_output")"
+  remote_10800_active_socket_count="$(awk -F= '$1=="REMOTE_10800_ACTIVE_SOCKET_COUNT" {print $2; exit}' <<<"$remote_output")"
+  remote_10800_stale_socket_count="$(awk -F= '$1=="REMOTE_10800_STALE_SOCKET_COUNT" {print $2; exit}' <<<"$remote_output")"
   remote_proxy_ip="$(awk -F= '$1=="REMOTE_PROXY_IP" {print $2; exit}' <<<"$remote_output")"
   chatgpt_code="$(awk -F= '$1=="CHATGPT_CODE" {print $2; exit}' <<<"$remote_output")"
   remote_app_count="$(awk -F= '$1=="REMOTE_APP_SERVER_COUNT" {print $2; exit}' <<<"$remote_output")"
@@ -389,6 +417,8 @@ sample() {
     capture { print }
   ' <<<"$remote_output")"
   remote_10800_socket_count="${remote_10800_socket_count:-0}"
+  remote_10800_active_socket_count="${remote_10800_active_socket_count:-0}"
+  remote_10800_stale_socket_count="${remote_10800_stale_socket_count:-0}"
   remote_codex_exec_count="${remote_codex_exec_count:-0}"
 
   {
@@ -396,6 +426,8 @@ sample() {
     printf 'REMOTE_HOST=%s\n' "$REMOTE_HOST"
     printf 'REMOTE_CODEX_EXEC_COUNT=%s\n' "$remote_codex_exec_count"
     printf 'REMOTE_10800_SOCKET_COUNT=%s\n' "$remote_10800_socket_count"
+    printf 'REMOTE_10800_ACTIVE_SOCKET_COUNT=%s\n' "$remote_10800_active_socket_count"
+    printf 'REMOTE_10800_STALE_SOCKET_COUNT=%s\n' "$remote_10800_stale_socket_count"
     printf 'REMOTE_APP_SERVER_COUNT=%s\n' "${remote_app_count:-0}"
     printf 'REMOTE_NOTTY_COUNT=%s\n' "${remote_notty_count:-0}"
     printf '\n'
@@ -434,6 +466,8 @@ REMOTE_SSH_RC=$remote_rc
 REMOTE_SSH_ERROR=$remote_error
 REMOTE_10800_COUNT=${remote_listen:-}
 REMOTE_10800_SOCKET_COUNT=$remote_10800_socket_count
+REMOTE_10800_ACTIVE_SOCKET_COUNT=$remote_10800_active_socket_count
+REMOTE_10800_STALE_SOCKET_COUNT=$remote_10800_stale_socket_count
 REMOTE_10800_IP=$remote_proxy_ip
 CHATGPT_CODE=$chatgpt_code
 REMOTE_CODEX_EXEC_COUNT=$remote_codex_exec_count
@@ -444,6 +478,7 @@ DEFAULT_IFACE=$default_iface
 DEFAULT_GATEWAY=$default_gateway
 GCP_IFACE=$gcp_iface
 GCP_GATEWAY=$gcp_gateway
+GCP_BIND_ADDRESS=$gcp_bind
 KINIT_STATUS=$status_file_status
 KINIT_MESSAGE=$status_file_message
 GCP_COUNTER_IFACE=$GCP_TRAFFIC_IFACE
@@ -469,6 +504,7 @@ EOF
   printf '"default_gateway":"%s",' "$(json_value "$default_gateway")"
   printf '"gcp_iface":"%s",' "$(json_value "$gcp_iface")"
   printf '"gcp_gateway":"%s",' "$(json_value "$gcp_gateway")"
+  printf '"gcp_bind_address":"%s",' "$(json_value "$gcp_bind")"
   printf '"gcp_counter_iface":"%s",' "$(json_value "$GCP_TRAFFIC_IFACE")"
   printf '"gcp_counter_ok":%s,' "$gcp_counter_ok"
   printf '"gcp_rx_bytes":%s,' "$(json_optional_number "$gcp_rx_bytes")"
@@ -486,6 +522,8 @@ EOF
   printf '"remote_ssh_error":"%s",' "$(json_value "$remote_error")"
   printf '"remote_10800_count":%s,' "${remote_listen:-0}"
   printf '"remote_10800_socket_count":%s,' "${remote_10800_socket_count:-0}"
+  printf '"remote_10800_active_socket_count":%s,' "${remote_10800_active_socket_count:-0}"
+  printf '"remote_10800_stale_socket_count":%s,' "${remote_10800_stale_socket_count:-0}"
   printf '"remote_10800_ip":"%s",' "$(json_value "$remote_proxy_ip")"
   printf '"chatgpt_code":"%s",' "$(json_value "$chatgpt_code")"
   printf '"remote_codex_exec_count":%s,' "${remote_codex_exec_count:-0}"

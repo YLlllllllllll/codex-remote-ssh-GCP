@@ -443,20 +443,11 @@ verify_codex_chain_clean_fast() {
         return 127
     fi
 
-    log "强制清理并重建 Codex Remote GCP 链路: ${CODEX_REFRESH_SCRIPT} clean-repair-fast"
-    run_with_timeout "$CODEX_TIMEOUT_SECONDS" "$CODEX_REFRESH_SCRIPT" clean-repair-fast
+    log "一键深度修复 Codex Remote GCP 链路: ${CODEX_REFRESH_SCRIPT} deep-repair"
+    run_with_timeout "$CODEX_TIMEOUT_SECONDS" "$CODEX_REFRESH_SCRIPT" deep-repair
     local rc=$?
     if [ "$rc" -ne 0 ]; then
-        log "失败, Codex Remote GCP 强制清理修复退出码 ${rc}"
-        reset_ssh_control_masters
-        return "$rc"
-    fi
-
-    log "快速验证 Codex Remote GCP 出海: ${CODEX_REFRESH_SCRIPT} verify-fast"
-    run_with_timeout "$CODEX_TIMEOUT_SECONDS" "$CODEX_REFRESH_SCRIPT" verify-fast
-    rc=$?
-    if [ "$rc" -ne 0 ]; then
-        log "失败, Codex Remote GCP 快速验证退出码 ${rc}"
+        log "失败, Codex Remote GCP 一键深度修复退出码 ${rc}"
         reset_ssh_control_masters
         return "$rc"
     fi
@@ -504,8 +495,8 @@ Would:
 EOF
             ;;
         remote-gcp)
-            echo "Would run: codex-gcp-remote --dry-run clean-repair-fast, then verify-fast"
-            CODEX_GCP_DRY_RUN=1 "$CODEX_REFRESH_SCRIPT" --dry-run clean-repair-fast 2>/dev/null || true
+            echo "Would run: codex-gcp-remote --dry-run deep-repair"
+            CODEX_GCP_DRY_RUN=1 "$CODEX_REFRESH_SCRIPT" --dry-run deep-repair 2>/dev/null || true
             ;;
         remote-gcp-full)
             echo "Would probe SSH, then run: codex-gcp-remote --dry-run repair, then verify"
