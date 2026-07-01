@@ -146,6 +146,9 @@ Commands:
   reset-socket-storm
              Reset remote 10800 and Codex app-server to clear excessive stale
              socket state, then rebuild the remote forward and verify.
+  restart-remote-app-server
+             Restart only remote Codex app-server/proxy processes. Use when
+             installed CLI matches but the UI still reports an older running CLI.
   debug-fast
              Snapshot the fixed path, run verify-fast, and only run
              clean-repair-fast if the fixed path is actually broken.
@@ -301,6 +304,14 @@ Would:
   - rebuild remote reverse HTTP forwarding and run verify-fast
 EOF
       ;;
+    restart-remote-app-server)
+      cat <<EOF
+Would:
+  - kill only remote Codex app-server/proxy processes
+  - leave local ${LOCAL_SOCKS_PORT}/${LOCAL_HTTP_PORT} and remote ${REMOTE_HTTP_PORT} forwarding untouched
+  - rely on Codex.app to reconnect and spawn a fresh remote runtime
+EOF
+      ;;
     debug-fast)
       cat <<EOF
 Would:
@@ -316,7 +327,8 @@ Would:
   - read remote Codex CLI version through ${REMOTE_HOST}
   - check that remote default model matches local official Codex config
   - check that remote wrappers and proxy.env point only at ${REMOTE_HTTP_HOST}:${REMOTE_HTTP_PORT}
-  - return non-zero if version, model, or wrapper drift is detected
+  - check whether a running remote app-server still uses a replaced/deleted CLI binary
+  - return non-zero if version, model, wrapper, or runtime drift is detected
 EOF
       ;;
     stop-egress)
@@ -412,7 +424,7 @@ acquire_repair_lock() {
 
 command_requires_repair_lock() {
   case "${1:-}" in
-    repair|repair-local-socks|repair-local-http|repair-remote-forward|repair-remote-sockets|repair-wrappers|repair-fast|clean-repair-fast|deep-repair|cleanup|reset-socket-storm|debug-fast|stop-egress|limit-egress|clean-workers|verify|verify-fast)
+    repair|repair-local-socks|repair-local-http|repair-remote-forward|repair-remote-sockets|repair-wrappers|repair-fast|clean-repair-fast|deep-repair|cleanup|reset-socket-storm|restart-remote-app-server|debug-fast|stop-egress|limit-egress|clean-workers|verify|verify-fast)
       return 0
       ;;
     *)
@@ -1302,6 +1314,47 @@ fi
 REMOTE
 }
 
+remote_codex_runtime_status() {
+  ssh_remote 'bash -s' <<'REMOTE'
+set -Eeuo pipefail
+
+stale=0
+total=0
+pids="$(ps -eo pid=,args= 2>/dev/null | awk '
+  /codex app-server proxy|app-server --listen unix:\/\// {
+    if ($0 !~ /awk /) {
+      print $1
+    }
+  }
+')"
+
+if [ -z "$pids" ]; then
+  echo "remote app-server runtime: none"
+  exit 0
+fi
+
+for pid in $pids; do
+  total=$((total + 1))
+  exe="$(readlink "/proc/$pid/exe" 2>/dev/null || true)"
+  args="$(ps -p "$pid" -o args= 2>/dev/null || true)"
+  case "$exe" in
+    *"(deleted)"*|*/.codex-*/node_modules/@openai/codex-linux-*/vendor/*/bin/codex)
+      stale=1
+      printf 'stale runtime pid=%s exe=%s args=%s\n' "$pid" "$exe" "$args"
+      ;;
+  esac
+done
+
+if [ "$stale" -eq 1 ]; then
+  printf 'remote app-server runtime: stale (%s process(es) checked)\n' "$total"
+  exit 42
+fi
+
+printf 'remote app-server runtime: fresh (%s process(es) checked)\n' "$total"
+exit 0
+REMOTE
+}
+
 remote_socket_summary() {
   section "Remote 10800 socket summary"
   ssh_remote "REMOTE_HTTP_PORT=$(shell_quote "$REMOTE_HTTP_PORT") bash -s" <<'REMOTE' || true
@@ -1711,6 +1764,12 @@ reset_socket_storm() {
   remote_socket_summary
 }
 
+restart_remote_app_server_only() {
+  restart_remote_codex_app_server
+  section "Remote Codex app-server restart requested"
+  printf 'Codex.app should reconnect and spawn a fresh remote runtime on the next SSH session.\n'
+}
+
 debug_snapshot() {
   section "Fast debug snapshot"
   printf 'GCP route: iface=%s gateway=%s bind=%s\n' \
@@ -1896,7 +1955,7 @@ printf '%s\n' \"\$codex_out\" | grep -q 'openai-ok'
 
 version_status() {
   section "Codex version and wrapper status"
-  local local_version remote_version local_model remote_model rc
+  local local_version remote_version local_model remote_model runtime_out runtime_rc rc
   local_version="$(local_codex_version || true)"
   remote_version="$(remote_codex_version || true)"
   local_model="$(local_codex_default_model || true)"
@@ -1923,6 +1982,19 @@ version_status() {
     rc=1
   fi
 
+  runtime_rc=0
+  runtime_out="$(remote_codex_runtime_status 2>&1)" || runtime_rc=$?
+  printf '%s\n' "$runtime_out"
+  if [[ "$runtime_rc" -eq 42 ]]; then
+    printf 'ERROR: remote Codex runtime was started before the installed CLI update; restart remote app-server\n' >&2
+    if [[ "$rc" -eq 0 ]]; then
+      rc=42
+    fi
+  elif [[ "$runtime_rc" -ne 0 ]]; then
+    printf 'ERROR: remote Codex runtime status check failed\n' >&2
+    rc=1
+  fi
+
   return "$rc"
 }
 
@@ -1941,7 +2013,7 @@ set -- "${args[@]}"
 
 cmd="${1:-}"
 case "$cmd" in
-  repair|repair-local-socks|repair-local-http|repair-remote-forward|repair-remote-sockets|repair-wrappers|repair-fast|clean-repair-fast|deep-repair|cleanup|reset-socket-storm|debug-fast|stop-egress|limit-egress|clean-workers|traffic-sample|diagnose|status|verify|verify-fast|version-status)
+  repair|repair-local-socks|repair-local-http|repair-remote-forward|repair-remote-sockets|repair-wrappers|repair-fast|clean-repair-fast|deep-repair|cleanup|reset-socket-storm|restart-remote-app-server|debug-fast|stop-egress|limit-egress|clean-workers|traffic-sample|diagnose|status|verify|verify-fast|version-status)
     if [[ "$DRY_RUN" == "1" ]]; then
       dry_run_plan "$cmd" "${2:-}"
       exit 0
@@ -1988,6 +2060,9 @@ case "$cmd" in
     ;;
   reset-socket-storm)
     reset_socket_storm
+    ;;
+  restart-remote-app-server)
+    restart_remote_app_server_only
     ;;
   debug-fast)
     debug_fast

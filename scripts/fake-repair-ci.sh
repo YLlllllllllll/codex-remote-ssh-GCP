@@ -93,6 +93,9 @@ need_pattern 'repair-local-http' bin/codex-gcp-remote
 need_pattern 'repair-remote-forward' bin/codex-gcp-remote
 need_pattern 'repair-remote-sockets' bin/codex-gcp-remote
 need_pattern 'version-status' bin/codex-gcp-remote
+need_pattern 'restart-remote-app-server' bin/codex-gcp-remote
+need_pattern 'remote_codex_runtime_status' bin/codex-gcp-remote
+need_pattern 'stale remote Codex runtime' bin/kinit-refresh
 need_pattern 'clean-repair-fast' bin/codex-gcp-remote
 need_pattern 'deep-repair' bin/codex-gcp-remote
 need_pattern 'sync_remote_codex_version' bin/codex-gcp-remote

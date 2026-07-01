@@ -79,6 +79,7 @@ codex-gcp-remote repair-local-http
 codex-gcp-remote repair-remote-forward
 codex-gcp-remote repair-remote-sockets
 codex-gcp-remote version-status
+codex-gcp-remote restart-remote-app-server
 codex-gcp-remote deep-repair
 codex-gcp-remote clean-repair-fast
 codex-gcp-remote verify-fast
@@ -155,6 +156,8 @@ AUTOHEAL_ALLOW_APP_SERVER_RESTART=0
 ```
 
 With `AUTOHEAL_ALLOW_APP_SERVER_RESTART=0`, remote `10800` socket storms and `chatgpt_unreachable_000` use `codex-gcp-remote repair-remote-sockets`, which rebuilds only the forward/socket layer and leaves Codex app-server processes running. Setting `AUTOHEAL_ALLOW_APP_SERVER_RESTART=1` allows the heavier `reset-socket-storm` path.
+
+`kinit-refresh smart-repair` also checks whether a running remote Codex app-server still points at a replaced or deleted CLI binary after an update. In that case it runs `codex-gcp-remote restart-remote-app-server`, which restarts only the remote Codex runtime so the installed CLI version and the UI's running CLI version converge.
 
 Disable it locally by setting `CODEX_GCP_AUTOHEAL_ENABLED=0` in `~/.config/codex-gcp-refresh/config.env`.
 

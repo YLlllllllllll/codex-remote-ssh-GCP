@@ -692,6 +692,11 @@ smart_verify_versions_if_needed() {
     if [ "$rc" -eq 0 ]; then
         return 0
     fi
+    if [ "$rc" -eq 42 ]; then
+        log "Smart-Repair: 检测到远端 Codex runtime 仍在运行升级前的 CLI, 只重启远端 app-server"
+        run_codex_repair_command restart-remote-app-server "远端 Codex CLI 已升级但 app-server runtime 仍是旧进程"
+        return "$?"
+    fi
 
     log "Smart-Repair: 检测到版本或 wrapper drift, 先执行轻量 wrapper 修复"
     run_codex_repair_command repair-wrappers "本地/远端 Codex wrapper 或 proxy.env 漂移"
@@ -878,8 +883,9 @@ Would:
       local_7890_missing/local_7890_bad     -> codex-gcp-remote --dry-run repair-local-http
       remote_10800/chatgpt data-plane issue -> codex-gcp-remote --dry-run repair-remote-forward
       many stale remote 10800 sockets       -> codex-gcp-remote --dry-run repair-remote-sockets
+      stale remote Codex runtime            -> codex-gcp-remote --dry-run restart-remote-app-server
       version/wrapper drift                 -> codex-gcp-remote --dry-run deep-repair
-  - avoid restarting remote Codex app-server unless deep repair is reached after smaller fixes fail
+  - avoid restarting remote Codex app-server except for explicit stale runtime or deep repair
 EOF
             ;;
         stop-gcp)
