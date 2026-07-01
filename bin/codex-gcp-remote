@@ -122,6 +122,16 @@ Usage: $(basename "$0") <command>
 Commands:
   diagnose   Print local/remote tunnel, wrapper, process, and config state.
   repair     Ensure local 1080, local 7890, remote 10800, and remote Codex wrappers.
+  repair-local-socks
+             Ensure only local 1080 SOCKS exits through the expected GCP IP.
+  repair-local-http
+             Ensure local 1080 SOCKS and local 7890 HTTP proxy.
+  repair-remote-forward
+             Ensure local 1080/7890 and remote 10800, then run verify-fast.
+  repair-remote-sockets
+             Reset only the remote 10800 SSH forward/socket layer, not Codex app-server.
+  repair-wrappers
+             Rewrite remote Codex wrappers/proxy.env after npm or App updates.
   repair-fast
              Ensure only local 1080, local 7890, and remote 10800.
   clean-repair-fast
@@ -151,6 +161,8 @@ Commands:
   verify     Run direct SSH remote Codex validation, including openai-ok.
   verify-fast
              Verify remote 10800 egress and ChatGPT endpoint reachability.
+  version-status
+             Check local/remote Codex version, default model, and remote wrapper health.
   status     Alias for diagnose.
 
 Options:
@@ -194,6 +206,50 @@ Would:
   - kill stale remote app-server/proxy processes tied to old proxy state
   - clean stale remote codex exec workers older than ${STALE_CODEX_EXEC_MIN_AGE}s
   - ensure remote reverse HTTP forward on ${REMOTE_HTTP_HOST}:${REMOTE_HTTP_PORT}
+EOF
+      ;;
+    repair-local-socks)
+      cat <<EOF
+Would:
+  - ensure the GCP host route bypasses stale VPN routing
+  - ensure local SSH SOCKS on ${LOCAL_SOCKS_HOST}:${LOCAL_SOCKS_PORT}
+  - validate local SOCKS exits as ${GCP_EXPECTED_IP} and can reach ChatGPT Codex endpoint
+EOF
+      ;;
+    repair-local-http)
+      cat <<EOF
+Would:
+  - ensure the GCP host route bypasses stale VPN routing
+  - ensure local SSH SOCKS on ${LOCAL_SOCKS_HOST}:${LOCAL_SOCKS_PORT}
+  - ensure local privoxy HTTP on ${LOCAL_HTTP_HOST}:${LOCAL_HTTP_PORT}
+EOF
+      ;;
+    repair-remote-forward)
+      cat <<EOF
+Would:
+  - ensure local SSH SOCKS on ${LOCAL_SOCKS_HOST}:${LOCAL_SOCKS_PORT}
+  - ensure local privoxy HTTP on ${LOCAL_HTTP_HOST}:${LOCAL_HTTP_PORT}
+  - clean stale remote codex exec workers older than ${STALE_CODEX_EXEC_MIN_AGE}s
+  - ensure remote reverse HTTP forwarding on ${REMOTE_HTTP_HOST}:${REMOTE_HTTP_PORT}
+  - run verify-fast
+EOF
+      ;;
+    repair-remote-sockets)
+      cat <<EOF
+Would:
+  - reset remote ${REMOTE_HTTP_PORT} forwarding ControlMasters and stale SSH tunnel sessions
+  - ensure local SSH SOCKS on ${LOCAL_SOCKS_HOST}:${LOCAL_SOCKS_PORT}
+  - ensure local privoxy HTTP on ${LOCAL_HTTP_HOST}:${LOCAL_HTTP_PORT}
+  - rebuild remote reverse HTTP forwarding and run verify-fast
+  - leave remote Codex app-server processes untouched
+EOF
+      ;;
+    repair-wrappers)
+      cat <<EOF
+Would:
+  - restore official remote codex.js if needed
+  - rewrite remote ~/.local/bin/codex-gcp, ~/.local/bin/codex, ~/.local/node/bin/codex, and ~/.codex/proxy.env
+  - leave local 1080/7890, remote 10800, and app-server processes untouched
 EOF
       ;;
     repair-fast)
@@ -251,6 +307,16 @@ Would:
   - snapshot listeners, local proxy egress, monitor state, and remote ${REMOTE_HTTP_PORT} sockets
   - run verify-fast
   - run clean-repair-fast only if verify-fast fails
+EOF
+      ;;
+    version-status)
+      cat <<EOF
+Would:
+  - read local Codex CLI version
+  - read remote Codex CLI version through ${REMOTE_HOST}
+  - check that remote default model matches local official Codex config
+  - check that remote wrappers and proxy.env point only at ${REMOTE_HTTP_HOST}:${REMOTE_HTTP_PORT}
+  - return non-zero if version, model, or wrapper drift is detected
 EOF
       ;;
     stop-egress)
@@ -346,7 +412,7 @@ acquire_repair_lock() {
 
 command_requires_repair_lock() {
   case "${1:-}" in
-    repair|repair-fast|clean-repair-fast|deep-repair|cleanup|reset-socket-storm|debug-fast|stop-egress|limit-egress|clean-workers|verify|verify-fast)
+    repair|repair-local-socks|repair-local-http|repair-remote-forward|repair-remote-sockets|repair-wrappers|repair-fast|clean-repair-fast|deep-repair|cleanup|reset-socket-storm|debug-fast|stop-egress|limit-egress|clean-workers|verify|verify-fast)
       return 0
       ;;
     *)
@@ -915,6 +981,7 @@ REMOTE
 
 ensure_remote_wrappers() {
   section "Ensure remote Codex wrappers"
+  sync_remote_codex_default_model
   if remote_wrappers_healthy; then
     printf 'remote Codex wrappers already healthy; leaving active app-server untouched\n'
     ssh_remote 'sha256sum "$HOME/.local/bin/codex-gcp" "$HOME/.local/node/bin/codex"; readlink -f "$HOME/.local/bin/codex"; "$HOME/.local/bin/codex" --version'
@@ -923,6 +990,7 @@ ensure_remote_wrappers() {
 
   restore_remote_official_js_if_needed
   write_remote_wrappers
+  sync_remote_codex_default_model
 }
 
 write_remote_wrappers() {
@@ -1347,12 +1415,79 @@ verify_local_socks_only() {
 }
 
 local_codex_version() {
-  command -v codex >/dev/null 2>&1 || return 1
-  codex --version 2>/dev/null | awk '$1 == "codex-cli" { print $2; exit }'
+  local codex_bin
+  codex_bin="$(command -v codex 2>/dev/null || true)"
+  if [[ -z "$codex_bin" && -x /Applications/Codex.app/Contents/Resources/codex ]]; then
+    codex_bin="/Applications/Codex.app/Contents/Resources/codex"
+  fi
+  [[ -n "$codex_bin" ]] || return 1
+  "$codex_bin" --version 2>/dev/null | awk '$1 == "codex-cli" { print $2; exit }'
 }
 
 remote_codex_version() {
   ssh_remote "codex --version 2>/dev/null | awk '\$1 == \"codex-cli\" { print \$2; exit }'" || true
+}
+
+local_codex_default_model() {
+  local config="$LOCAL_HOME/.codex/config.toml"
+  [[ -f "$config" ]] || return 1
+  sed -nE 's/^[[:space:]]*model[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' "$config" | head -n 1
+}
+
+remote_codex_default_model() {
+  ssh_remote 'sed -nE '\''s/^[[:space:]]*model[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p'\'' "$HOME/.codex/config.toml" 2>/dev/null | head -n 1' || true
+}
+
+sync_remote_codex_default_model() {
+  local model
+  model="$(local_codex_default_model || true)"
+  if [[ -z "$model" ]]; then
+    printf 'local Codex default model unavailable; leaving remote default model unchanged\n'
+    return 0
+  fi
+
+  ssh_remote "LOCAL_CODEX_DEFAULT_MODEL=$(shell_quote "$model") bash -s" <<'REMOTE'
+set -Eeuo pipefail
+
+config="$HOME/.codex/config.toml"
+model="$LOCAL_CODEX_DEFAULT_MODEL"
+mkdir -p "$HOME/.codex"
+
+if [[ ! -f "$config" ]]; then
+  printf 'model = "%s"\n' "$model" > "$config"
+  chmod 600 "$config"
+  printf 'remote default model initialized to %s\n' "$model"
+  exit 0
+fi
+
+current="$(sed -nE 's/^[[:space:]]*model[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' "$config" | head -n 1)"
+if [[ "$current" == "$model" ]]; then
+  printf 'remote default model already matches local: %s\n' "$model"
+  exit 0
+fi
+
+backup="$config.model-sync.$(date +%Y%m%d%H%M%S)"
+tmp="$(mktemp)"
+cp -p "$config" "$backup"
+awk -v model="$model" '
+  BEGIN { done = 0 }
+  /^[[:space:]]*model[[:space:]]*=/ && done == 0 {
+    print "model = \"" model "\""
+    done = 1
+    next
+  }
+  { print }
+  END {
+    if (done == 0) {
+      print "model = \"" model "\""
+    }
+  }
+' "$config" > "$tmp"
+cat "$tmp" > "$config"
+rm -f "$tmp"
+chmod 600 "$config"
+printf 'remote default model changed from %s to %s; backup=%s\n' "${current:-empty}" "$model" "$backup"
+REMOTE
 }
 
 sync_remote_codex_version() {
@@ -1507,6 +1642,40 @@ repair() {
   start_remote_forward
   section "Repair complete"
   printf 'Run final validation with: %s verify\n' "$(basename "$0")"
+}
+
+repair_local_socks() {
+  start_local_socks
+  verify_local_socks_only
+}
+
+repair_local_http() {
+  start_local_socks
+  start_local_http
+}
+
+repair_remote_forward() {
+  start_local_socks
+  start_local_http
+  clean_stale_remote_codex_exec
+  SKIP_REMOTE_PLAIN_CHECK=1
+  start_remote_forward
+  verify_fast
+}
+
+repair_remote_sockets() {
+  force_reset_remote_proxy
+  start_local_socks
+  start_local_http
+  SKIP_REMOTE_PLAIN_CHECK=1
+  start_remote_forward
+  verify_fast
+  remote_socket_summary
+}
+
+repair_wrappers() {
+  ensure_remote_wrappers
+  version_status
 }
 
 repair_fast() {
@@ -1725,6 +1894,38 @@ printf '%s\n' \"\$codex_out\" | grep -q 'openai-ok'
   fi
 }
 
+version_status() {
+  section "Codex version and wrapper status"
+  local local_version remote_version local_model remote_model rc
+  local_version="$(local_codex_version || true)"
+  remote_version="$(remote_codex_version || true)"
+  local_model="$(local_codex_default_model || true)"
+  remote_model="$(remote_codex_default_model || true)"
+  printf 'local codex version:  %s\n' "${local_version:-unknown}"
+  printf 'remote codex version: %s\n' "${remote_version:-unknown}"
+  printf 'local default model:  %s\n' "${local_model:-unknown}"
+  printf 'remote default model: %s\n' "${remote_model:-unknown}"
+
+  rc=0
+  if [[ -z "$local_version" || -z "$remote_version" || "$local_version" != "$remote_version" ]]; then
+    printf 'ERROR: local and remote Codex CLI versions differ or are unavailable\n' >&2
+    rc=1
+  fi
+  if [[ -n "$local_model" && "$remote_model" != "$local_model" ]]; then
+    printf 'ERROR: local and remote Codex default models differ\n' >&2
+    rc=1
+  fi
+
+  if remote_wrappers_healthy; then
+    printf 'remote wrappers: healthy\n'
+  else
+    printf 'ERROR: remote wrappers or proxy.env drift detected\n' >&2
+    rc=1
+  fi
+
+  return "$rc"
+}
+
 args=()
 for arg in "$@"; do
   case "$arg" in
@@ -1740,7 +1941,7 @@ set -- "${args[@]}"
 
 cmd="${1:-}"
 case "$cmd" in
-  repair|repair-fast|clean-repair-fast|deep-repair|cleanup|reset-socket-storm|debug-fast|stop-egress|limit-egress|clean-workers|traffic-sample|diagnose|status|verify|verify-fast)
+  repair|repair-local-socks|repair-local-http|repair-remote-forward|repair-remote-sockets|repair-wrappers|repair-fast|clean-repair-fast|deep-repair|cleanup|reset-socket-storm|debug-fast|stop-egress|limit-egress|clean-workers|traffic-sample|diagnose|status|verify|verify-fast|version-status)
     if [[ "$DRY_RUN" == "1" ]]; then
       dry_run_plan "$cmd" "${2:-}"
       exit 0
@@ -1757,6 +1958,21 @@ case "$cmd" in
     ;;
   repair)
     repair
+    ;;
+  repair-local-socks)
+    repair_local_socks
+    ;;
+  repair-local-http)
+    repair_local_http
+    ;;
+  repair-remote-forward)
+    repair_remote_forward
+    ;;
+  repair-remote-sockets)
+    repair_remote_sockets
+    ;;
+  repair-wrappers)
+    repair_wrappers
     ;;
   repair-fast)
     repair_fast
@@ -1793,6 +2009,9 @@ case "$cmd" in
     ;;
   verify-fast)
     verify_fast
+    ;;
+  version-status)
+    version_status
     ;;
   -h|--help|help|"")
     usage

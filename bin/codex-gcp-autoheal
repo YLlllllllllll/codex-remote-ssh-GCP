@@ -32,6 +32,7 @@ AUTOHEAL_SOCKET_STORM_COOLDOWN_SECONDS="${AUTOHEAL_SOCKET_STORM_COOLDOWN_SECONDS
 AUTOHEAL_MAX_SAMPLE_AGE_SECONDS="${AUTOHEAL_MAX_SAMPLE_AGE_SECONDS:-300}"
 AUTOHEAL_REPAIR_MODE="${AUTOHEAL_REPAIR_MODE:-remote-gcp}"
 AUTOHEAL_STALE_SOCKET_THRESHOLD="${AUTOHEAL_STALE_SOCKET_THRESHOLD:-20}"
+AUTOHEAL_ALLOW_APP_SERVER_RESTART="${AUTOHEAL_ALLOW_APP_SERVER_RESTART:-0}"
 
 log() {
   mkdir -p "$STATE_DIR"
@@ -203,7 +204,7 @@ should_autoheal() {
           printf 'skip: socket-storm cooldown %ss remaining\n' "$remaining"
           return 1
         fi
-        printf 'heal: cause=remote_10800_data_plane_reset monitor_cause=%s stale_sockets=%s\n' "$cause" "$stale_sockets"
+        printf 'heal: cause=remote_10800_data_plane_repair_remote_sockets monitor_cause=%s stale_sockets=%s\n' "$cause" "$stale_sockets"
         return 0
         ;;
     esac
@@ -281,15 +282,31 @@ run_once() {
   printf '%s\n' "$(date +%s)" > "$AUTOHEAL_LAST_FILE"
   log "start: $decision"
   rc=0
-  if [[ "$decision" == *"cause=remote_10800_socket_storm"* || "$decision" == *"cause=remote_10800_data_plane_reset"* ]]; then
+  if [[ "$decision" == *"cause=remote_10800_socket_storm"* ]]; then
     printf '%s\n' "$(date +%s)" > "$AUTOHEAL_SOCKET_STORM_LAST_FILE"
-    if "$REMOTE_SCRIPT" reset-socket-storm >> "$AUTOHEAL_LOG_FILE" 2>&1; then
+    if [[ "$AUTOHEAL_ALLOW_APP_SERVER_RESTART" == "1" ]]; then
+      if "$REMOTE_SCRIPT" reset-socket-storm >> "$AUTOHEAL_LOG_FILE" 2>&1; then
+        rc=0
+      else
+        rc=$?
+      fi
+    else
+      log "socket storm detected, using repair-remote-sockets because app-server restart is disabled"
+      if "$REMOTE_SCRIPT" repair-remote-sockets >> "$AUTOHEAL_LOG_FILE" 2>&1; then
+        rc=0
+      else
+        rc=$?
+      fi
+    fi
+  elif [[ "$decision" == *"cause=remote_10800_data_plane_repair_remote_sockets"* ]]; then
+    printf '%s\n' "$(date +%s)" > "$AUTOHEAL_SOCKET_STORM_LAST_FILE"
+    if "$REMOTE_SCRIPT" repair-remote-sockets >> "$AUTOHEAL_LOG_FILE" 2>&1; then
       rc=0
     else
       rc=$?
     fi
   else
-    if "$KINIT_SCRIPT" "$AUTOHEAL_REPAIR_MODE" >> "$AUTOHEAL_LOG_FILE" 2>&1; then
+    if "$REMOTE_SCRIPT" repair-fast >> "$AUTOHEAL_LOG_FILE" 2>&1; then
       rc=0
     else
       rc=$?
@@ -309,6 +326,7 @@ status() {
   printf 'cooldown_seconds=%s\n' "$AUTOHEAL_COOLDOWN_SECONDS"
   printf 'socket_storm_cooldown_seconds=%s\n' "$AUTOHEAL_SOCKET_STORM_COOLDOWN_SECONDS"
   printf 'stale_socket_threshold=%s\n' "$AUTOHEAL_STALE_SOCKET_THRESHOLD"
+  printf 'allow_app_server_restart=%s\n' "$AUTOHEAL_ALLOW_APP_SERVER_RESTART"
   printf 'latest_decision=%s\n' "$(should_autoheal 2>/dev/null || true)"
   if [[ -f "$AUTOHEAL_LOG_FILE" ]]; then
     tail -n 20 "$AUTOHEAL_LOG_FILE"

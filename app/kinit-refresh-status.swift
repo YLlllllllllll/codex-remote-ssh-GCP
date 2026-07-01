@@ -19,6 +19,7 @@ final class StatusApp: NSObject, NSApplicationDelegate {
     private lazy var gcpStateDir = "\(home)/.codex-gcp-tunnel"
     private lazy var gcpDiagnoseLogPath = "\(home)/.codex-gcp-tunnel/gcp-diagnose-latest.log"
     private lazy var autohealStatusLogPath = "\(home)/.codex-gcp-tunnel/autoheal-status-latest.log"
+    private lazy var incidentLogPath = "\(home)/.codex-gcp-tunnel/incidents"
     private lazy var stayAwakeScript = "\(home)/bin/stay-awake.sh"
     private lazy var stayAwakePlist = "\(home)/Library/LaunchAgents/com.example.stay-awake.plist"
     private let stayAwakeLabel = "com.example.stay-awake"
@@ -26,14 +27,18 @@ final class StatusApp: NSObject, NSApplicationDelegate {
     private let staleSeconds: TimeInterval = 20 * 60
     private var timer: Timer?
     private let summaryItem = NSMenuItem(title: "刷新状态中...", action: nil, keyEquivalent: "")
-    private let refreshGCPItem = NSMenuItem(title: "修复 GCP", action: #selector(refreshRemoteGCP), keyEquivalent: "g")
+    private let smartRepairItem = NSMenuItem(title: "智能修复", action: #selector(smartRepairGCP), keyEquivalent: "g")
     private let verifyGCPItem = NSMenuItem(title: "验证 GCP", action: #selector(verifyGCP), keyEquivalent: "v")
     private let diagnoseGCPItem = NSMenuItem(title: "诊断 GCP", action: #selector(diagnoseGCP), keyEquivalent: "d")
+    private let incidentLogItem = NSMenuItem(title: "查看 Incident 日志", action: #selector(openIncidentLogs), keyEquivalent: "i")
     private let autohealGCPItem = NSMenuItem(title: "触发 Auto-Heal", action: #selector(triggerAutoheal), keyEquivalent: "h")
     private let autohealStatusItem = NSMenuItem(title: "查看 Auto-Heal 状态", action: #selector(showAutohealStatus), keyEquivalent: "")
     private let sessionsItem = NSMenuItem(title: "Codex Sessions: 采样中", action: nil, keyEquivalent: "")
     private let sessionsMenu = NSMenu(title: "Codex Sessions")
+    private let advancedItem = NSMenuItem(title: "高级", action: nil, keyEquivalent: "")
+    private let advancedMenu = NSMenu(title: "高级")
     private let kinitLoginItem = NSMenuItem(title: "登录/更新 kinit", action: #selector(loginKinit), keyEquivalent: "k")
+    private let refreshSSHItem = NSMenuItem(title: "刷新 SSH", action: #selector(refreshSSH), keyEquivalent: "r")
     private let resetCursorItem = NSMenuItem(title: "重置 Cursor SSH", action: #selector(resetCursorSSH), keyEquivalent: "u")
     private let toggleStayAwakeItem = NSMenuItem(title: "保持唤醒", action: #selector(toggleStayAwake), keyEquivalent: "a")
 
@@ -50,17 +55,22 @@ final class StatusApp: NSObject, NSApplicationDelegate {
         let menu = NSMenu()
         menu.addItem(summaryItem)
         menu.addItem(NSMenuItem.separator())
-        menu.addItem(refreshGCPItem)
-        menu.addItem(verifyGCPItem)
-        menu.addItem(diagnoseGCPItem)
-        menu.addItem(autohealGCPItem)
-        menu.addItem(autohealStatusItem)
+        menu.addItem(smartRepairItem)
         sessionsItem.submenu = sessionsMenu
         menu.addItem(sessionsItem)
         menu.addItem(kinitLoginItem)
-        menu.addItem(NSMenuItem(title: "刷新 SSH", action: #selector(refreshSSH), keyEquivalent: "r"))
-        menu.addItem(resetCursorItem)
         menu.addItem(toggleStayAwakeItem)
+        advancedItem.submenu = advancedMenu
+        advancedMenu.addItem(verifyGCPItem)
+        advancedMenu.addItem(diagnoseGCPItem)
+        advancedMenu.addItem(incidentLogItem)
+        advancedMenu.addItem(autohealGCPItem)
+        advancedMenu.addItem(autohealStatusItem)
+        advancedMenu.addItem(NSMenuItem.separator())
+        advancedMenu.addItem(refreshSSHItem)
+        advancedMenu.addItem(resetCursorItem)
+        menu.addItem(NSMenuItem.separator())
+        menu.addItem(advancedItem)
         statusItem.menu = menu
         statusItem.autosaveName = NSStatusItem.AutosaveName("com.example.kinit-refresh-status")
         statusItem.button?.title = "⚪KC"
@@ -117,13 +127,15 @@ final class StatusApp: NSObject, NSApplicationDelegate {
         let gcpState = monitorGcpOk ? "GCP 可用" : message
         summaryItem.title = "\(detailTitle) | Kinit: \(kinitLabel) | SSH: \(ssh) | \(gcpState)"
         summaryItem.toolTip = "Proxy: \(proxy) | Codex: \(codex) | 更新: \(updated) | \(trafficLabel)"
-        refreshGCPItem.title = "修复 GCP    \(trafficLabel)"
-        refreshGCPItem.toolTip = trafficTooltip(traffic)
+        smartRepairItem.title = "智能修复    \(trafficLabel)"
+        smartRepairItem.toolTip = "先诊断再选择最小修复动作；\(trafficTooltip(traffic))"
         verifyGCPItem.toolTip = "只验证本地 1080/7890、远程 10800、GCP 出口 IP 和 ChatGPT Codex endpoint，不重建链路"
         diagnoseGCPItem.toolTip = "输出本地监听、远程 10800、Codex wrapper、app-server 环境和最近日志到 \(gcpDiagnoseLogPath)"
+        incidentLogItem.toolTip = "打开 monitor 自动捕获的问题证据包目录，用于复盘短暂波动和不可复现故障"
         autohealGCPItem.toolTip = "立即运行一轮 codex-gcp-autoheal；只有满足连续失败、冷却窗口等条件时才会触发修复"
         autohealStatusItem.toolTip = "查看 auto-heal 最近决策和日志尾部"
         kinitLoginItem.toolTip = "输入一次 Kerberos 密码并保存到 macOS Keychain；之后刷新 SSH 会自动执行 kinit"
+        refreshSSHItem.toolTip = "只刷新 Kerberos 与公司 SSH 链路，不修复 Codex GCP"
         resetCursorItem.toolTip = "只重置 Cursor Remote SSH 的本地 ssh 隧道，不退出 Cursor 主应用"
         updateSessionsMenu(traffic: traffic, sessions: sessions)
 
@@ -364,8 +376,8 @@ final class StatusApp: NSObject, NSApplicationDelegate {
         runRefresh(title: "🟡KC", arguments: ["ssh-only"])
     }
 
-    @objc private func refreshRemoteGCP() {
-        runRefresh(title: "🟡KC", arguments: ["remote-gcp"])
+    @objc private func smartRepairGCP() {
+        runRefresh(title: "🟡KC", arguments: ["smart-repair"])
     }
 
     @objc private func verifyGCP() {
@@ -394,6 +406,14 @@ final class StatusApp: NSObject, NSApplicationDelegate {
             outputPath: autohealStatusLogPath,
             openOutput: true
         )
+    }
+
+    @objc private func openIncidentLogs() {
+        try? FileManager.default.createDirectory(
+            atPath: incidentLogPath,
+            withIntermediateDirectories: true
+        )
+        NSWorkspace.shared.open(URL(fileURLWithPath: incidentLogPath))
     }
 
     @objc private func resetCursorSSH() {

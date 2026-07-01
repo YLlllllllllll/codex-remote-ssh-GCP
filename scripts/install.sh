@@ -18,6 +18,7 @@ fi
 
 install -m 0755 "$ROOT/bin/kinit-refresh" "$BIN_DIR/kinit-refresh"
 install -m 0755 "$ROOT/bin/codex-gcp-remote" "$BIN_DIR/codex-gcp-remote"
+install -m 0755 "$ROOT/bin/codex-gcp-socks-session" "$BIN_DIR/codex-gcp-socks-session"
 install -m 0755 "$ROOT/bin/codex-gcp-forward-session" "$BIN_DIR/codex-gcp-forward-session"
 install -m 0755 "$ROOT/bin/codex-gcp-monitor" "$BIN_DIR/codex-gcp-monitor"
 install -m 0755 "$ROOT/bin/codex-gcp-autoheal" "$BIN_DIR/codex-gcp-autoheal"
@@ -30,6 +31,7 @@ swiftc "$ROOT/app/kinit-refresh-status.swift" -o "$BIN_DIR/kinit-refresh-status"
 sed "s#@HOME@#$HOME_DIR#g" "$ROOT/launchd/com.example.kinit-refresh.plist" > "$LAUNCH_DIR/com.example.kinit-refresh.plist"
 sed "s#@HOME@#$HOME_DIR#g" "$ROOT/launchd/com.example.kinit-refresh-status.plist" > "$LAUNCH_DIR/com.example.kinit-refresh-status.plist"
 sed "s#@HOME@#$HOME_DIR#g" "$ROOT/launchd/com.example.stay-awake.plist" > "$LAUNCH_DIR/com.example.stay-awake.plist"
+sed "s#@HOME@#$HOME_DIR#g" "$ROOT/launchd/com.bytedance.codex.gcp-socks.plist" > "$LAUNCH_DIR/com.bytedance.codex.gcp-socks.plist"
 sed "s#@HOME@#$HOME_DIR#g" "$ROOT/launchd/com.example.codex-gcp-forward.plist" > "$LAUNCH_DIR/com.example.codex-gcp-forward.plist"
 sed "s#@HOME@#$HOME_DIR#g" "$ROOT/launchd/com.example.codex-gcp-monitor.plist" > "$LAUNCH_DIR/com.example.codex-gcp-monitor.plist"
 sed "s#@HOME@#$HOME_DIR#g" "$ROOT/launchd/com.example.codex-gcp-autoheal.plist" > "$LAUNCH_DIR/com.example.codex-gcp-autoheal.plist"
@@ -42,6 +44,9 @@ launchctl kickstart -k "gui/$(id -u)/com.example.kinit-refresh-status" 2>/dev/nu
 launchctl bootout "gui/$(id -u)" "$LAUNCH_DIR/com.example.codex-gcp-monitor.plist" 2>/dev/null || true
 launchctl bootstrap "gui/$(id -u)" "$LAUNCH_DIR/com.example.codex-gcp-monitor.plist" 2>/dev/null || true
 launchctl kickstart -k "gui/$(id -u)/com.example.codex-gcp-monitor" 2>/dev/null || true
+launchctl bootout "gui/$(id -u)" "$LAUNCH_DIR/com.bytedance.codex.gcp-socks.plist" 2>/dev/null || true
+launchctl bootstrap "gui/$(id -u)" "$LAUNCH_DIR/com.bytedance.codex.gcp-socks.plist" 2>/dev/null || true
+launchctl kickstart -k "gui/$(id -u)/com.bytedance.codex.gcp-socks" 2>/dev/null || true
 launchctl bootout "gui/$(id -u)" "$LAUNCH_DIR/com.example.codex-gcp-autoheal.plist" 2>/dev/null || true
 launchctl bootstrap "gui/$(id -u)" "$LAUNCH_DIR/com.example.codex-gcp-autoheal.plist" 2>/dev/null || true
 launchctl kickstart -k "gui/$(id -u)/com.example.codex-gcp-autoheal" 2>/dev/null || true
@@ -52,7 +57,7 @@ Installed.
 Next:
   1. Edit $CONFIG_DIR/config.env
   2. Run: kinit-refresh save-password
-  3. Run: kinit-refresh remote-gcp
+  3. Run: kinit-refresh smart-repair
   4. Monitor: codex-gcp-monitor status
   5. Autoheal: codex-gcp-autoheal status
 EOF

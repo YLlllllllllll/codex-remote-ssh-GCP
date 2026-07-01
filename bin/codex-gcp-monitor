@@ -40,6 +40,10 @@ STATE_DIR="${STATE_DIR:-$LOCAL_HOME/.codex-gcp-tunnel}"
 LOG_FILE="${MONITOR_LOG_FILE:-$STATE_DIR/monitor.jsonl}"
 LATEST_FILE="${MONITOR_LATEST_FILE:-$STATE_DIR/monitor-latest.env}"
 SESSIONS_FILE="${MONITOR_SESSIONS_FILE:-$STATE_DIR/active-sessions.txt}"
+INCIDENT_DIR="${MONITOR_INCIDENT_DIR:-$STATE_DIR/incidents}"
+INCIDENT_INDEX_FILE="${MONITOR_INCIDENT_INDEX_FILE:-$INCIDENT_DIR/incidents.jsonl}"
+INCIDENT_LAST_FILE="${MONITOR_INCIDENT_LAST_FILE:-$INCIDENT_DIR/last.env}"
+INCIDENT_MIN_INTERVAL_SECONDS="${MONITOR_INCIDENT_MIN_INTERVAL_SECONDS:-60}"
 LOCAL_HTTP_URL="http://${LOCAL_HTTP_HOST}:${LOCAL_HTTP_PORT}"
 REMOTE_HTTP_URL="http://${REMOTE_HTTP_HOST}:${REMOTE_HTTP_PORT}"
 
@@ -341,6 +345,149 @@ rotate_if_needed() {
   fi
 }
 
+safe_name() {
+  printf '%s' "$1" | tr -c 'A-Za-z0-9_.-' '_'
+}
+
+last_incident_value() {
+  local key="$1"
+  awk -F= -v key="$key" '$1 == key { print $2; exit }' "$INCIDENT_LAST_FILE" 2>/dev/null || true
+}
+
+section_to_file() {
+  local file="$1" title="$2"
+  {
+    printf '\n== %s ==\n' "$title"
+    cat
+  } >> "$file"
+}
+
+capture_incident_if_needed() {
+  [[ "$status" != "ok" ]] || return 0
+
+  local last_epoch last_cause elapsed incident_id incident_path safe_cause
+  last_epoch="$(last_incident_value EPOCH)"
+  last_cause="$(last_incident_value CAUSE)"
+  case "$last_epoch" in
+    ''|*[!0-9]*) last_epoch=0 ;;
+  esac
+  elapsed=$((epoch - last_epoch))
+  if [[ "$cause" == "$last_cause" && "$elapsed" -lt "$INCIDENT_MIN_INTERVAL_SECONDS" ]]; then
+    return 0
+  fi
+
+  mkdir -p "$INCIDENT_DIR"
+  safe_cause="$(safe_name "$cause")"
+  incident_id="$(date '+%Y%m%d-%H%M%S')-${safe_cause}"
+  incident_path="$INCIDENT_DIR/$incident_id"
+  mkdir -p "$incident_path"
+
+  cp "$LATEST_FILE" "$incident_path/monitor-latest.env" 2>/dev/null || true
+  cp "$SESSIONS_FILE" "$incident_path/active-sessions.txt" 2>/dev/null || true
+
+  {
+    printf 'INCIDENT_ID=%s\n' "$incident_id"
+    printf 'INCIDENT_PATH=%s\n' "$incident_path"
+    printf 'TS=%s\n' "$ts"
+    printf 'EPOCH=%s\n' "$epoch"
+    printf 'STATUS=%s\n' "$status"
+    printf 'CAUSE=%s\n' "$cause"
+    printf 'GCP_TCP=%s\n' "$gcp_tcp"
+    printf 'LOCAL_1080_COUNT=%s\n' "$socks_count"
+    printf 'LOCAL_1080_PIDS=%s\n' "$socks_pids"
+    printf 'LOCAL_7890_COUNT=%s\n' "$http_count"
+    printf 'LOCAL_7890_PIDS=%s\n' "$http_pids"
+    printf 'LOCAL_7890_IP=%s\n' "$local_http_ip"
+    printf 'REMOTE_10800_COUNT=%s\n' "${remote_listen:-0}"
+    printf 'REMOTE_10800_SOCKET_COUNT=%s\n' "${remote_10800_socket_count:-0}"
+    printf 'REMOTE_10800_ACTIVE_SOCKET_COUNT=%s\n' "${remote_10800_active_socket_count:-0}"
+    printf 'REMOTE_10800_STALE_SOCKET_COUNT=%s\n' "${remote_10800_stale_socket_count:-0}"
+    printf 'REMOTE_10800_IP=%s\n' "$remote_proxy_ip"
+    printf 'CHATGPT_CODE=%s\n' "$chatgpt_code"
+    printf 'REMOTE_SSH_RC=%s\n' "$remote_rc"
+    printf 'REMOTE_SSH_ERROR=%s\n' "$remote_error"
+    printf 'GCP_IFACE=%s\n' "$gcp_iface"
+    printf 'GCP_GATEWAY=%s\n' "$gcp_gateway"
+    printf 'GCP_BIND_ADDRESS=%s\n' "$gcp_bind"
+  } > "$incident_path/summary.env"
+
+  evidence="$incident_path/evidence.log"
+  {
+    printf 'Incident %s\n' "$incident_id"
+    printf 'Captured at %s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+  } > "$evidence"
+
+  { scutil --proxy 2>&1 || true; } | section_to_file "$evidence" "macOS proxy"
+  {
+    for key in HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy OPENAI_BASE_URL; do
+      printf '%s=%s\n' "$key" "$(launchctl getenv "$key" 2>/dev/null || true)"
+    done
+  } | section_to_file "$evidence" "launchctl proxy environment"
+  { route -n get "$GCP_HOST" 2>&1 || true; route -n get chatgpt.com 2>&1 || true; } | section_to_file "$evidence" "routes"
+  { sysctl net.inet.tcp.msl net.inet.ip.portrange.first net.inet.ip.portrange.last net.inet.ip.portrange.hifirst net.inet.ip.portrange.hilast 2>&1 || true; } | section_to_file "$evidence" "tcp sysctl"
+  { lsof -nP -iTCP:"$LOCAL_SOCKS_PORT" -sTCP:LISTEN 2>&1 || true; lsof -nP -iTCP:"$LOCAL_HTTP_PORT" -sTCP:LISTEN 2>&1 || true; } | section_to_file "$evidence" "local listeners"
+  {
+    netstat -an -p tcp 2>/dev/null | awk -v socks="[.:]${LOCAL_SOCKS_PORT}$" -v http="[.:]${LOCAL_HTTP_PORT}$" '
+      ($4 ~ socks || $5 ~ socks || $4 ~ http || $5 ~ http) { c[$6]++ }
+      END {
+        total=0
+        for (s in c) total += c[s]
+        printf "TOTAL=%d", total
+        for (s in c) printf " %s=%d", s, c[s]
+        printf "\n"
+      }
+    '
+  } | section_to_file "$evidence" "local 1080/7890 tcp states"
+  { launchctl print "gui/$(id -u)/com.bytedance.codex.gcp-socks" 2>&1 | sed -n '1,140p' || true; } | section_to_file "$evidence" "local socks launchd"
+  { launchctl print "gui/$(id -u)/com.example.codex-gcp-forward" 2>&1 | sed -n '1,140p' || true; } | section_to_file "$evidence" "remote forward launchd"
+  {
+    printf 'direct ip: '
+    curl -sS --connect-timeout "$MONITOR_CONNECT_TIMEOUT" --max-time "$MONITOR_MAX_TIME" "$IP_CHECK_URL" 2>&1 || true
+    printf '\ndirect chatgpt code: '
+    curl -sS -o /dev/null -w '%{http_code}' --connect-timeout "$MONITOR_CONNECT_TIMEOUT" --max-time "$MONITOR_MAX_TIME" "$CHATGPT_CODEX_URL" 2>&1 || true
+    printf '\nvia 1080 ip: '
+    ALL_PROXY="socks5h://127.0.0.1:${LOCAL_SOCKS_PORT}" curl -sS --connect-timeout "$MONITOR_CONNECT_TIMEOUT" --max-time "$MONITOR_MAX_TIME" "$IP_CHECK_URL" 2>&1 || true
+    printf '\nvia 7890 ip: '
+    curl -sS -x "$LOCAL_HTTP_URL" --connect-timeout "$MONITOR_CONNECT_TIMEOUT" --max-time "$MONITOR_MAX_TIME" "$IP_CHECK_URL" 2>&1 || true
+    printf '\nvia 7890 chatgpt code: '
+    curl -sS -o /dev/null -w '%{http_code}' -x "$LOCAL_HTTP_URL" --connect-timeout "$MONITOR_CONNECT_TIMEOUT" --max-time "$MONITOR_MAX_TIME" "$CHATGPT_CODEX_URL" 2>&1 || true
+    printf '\n'
+  } | section_to_file "$evidence" "local reachability probes"
+  {
+    bind_arg=()
+    [[ -n "$gcp_bind" ]] && bind_arg=(-s "$gcp_bind")
+    nc "${bind_arg[@]}" -vz -G "$MONITOR_CONNECT_TIMEOUT" "$GCP_HOST" "$GCP_PORT" 2>&1 || true
+  } | section_to_file "$evidence" "gcp tcp probe"
+  {
+    ssh -o BatchMode=yes -o ConnectTimeout="$MONITOR_CONNECT_TIMEOUT" -o ConnectionAttempts=1 "$REMOTE_HOST" \
+      "printf 'remote 10800 states: '; ss -tan '( sport = :${REMOTE_HTTP_PORT} or dport = :${REMOTE_HTTP_PORT} )' 2>/dev/null | tail -n +2 | awk '{c[\$1]++} END{total=0; for (s in c) total+=c[s]; printf \"TOTAL=%d\", total; for (s in c) printf \" %s=%d\", s, c[s]; printf \"\\n\"}'; printf '\\nremote app-server processes:\\n'; ps -eo pid=,ppid=,etimes=,args= 2>/dev/null | grep -E 'codex app-server proxy|app-server --listen unix://' | grep -v grep || true" 2>&1 || true
+  } | section_to_file "$evidence" "remote 10800 and app-server"
+  { tail -120 "$LOG_FILE" 2>/dev/null || true; } > "$incident_path/monitor-tail.jsonl"
+  { tail -120 "$STATE_DIR/autoheal.log" 2>/dev/null || true; } > "$incident_path/autoheal-tail.log"
+  { tail -120 "$STATE_DIR/gcp-socks.launchd.ssh.log" 2>/dev/null || true; } > "$incident_path/gcp-socks-ssh-tail.log"
+  { tail -120 "$STATE_DIR/gcp-socks.health.log" 2>/dev/null || true; } > "$incident_path/gcp-socks-health-tail.log"
+
+  printf '{"ts":"%s","epoch":%s,"incident_id":"%s","path":"%s","status":"%s","cause":"%s","gcp_tcp":"%s","local_7890_ip":"%s","remote_10800_ip":"%s","chatgpt_code":"%s","remote_10800_stale_socket_count":%s}\n' \
+    "$(json_value "$ts")" \
+    "$epoch" \
+    "$(json_value "$incident_id")" \
+    "$(json_value "$incident_path")" \
+    "$(json_value "$status")" \
+    "$(json_value "$cause")" \
+    "$(json_value "$gcp_tcp")" \
+    "$(json_value "$local_http_ip")" \
+    "$(json_value "$remote_proxy_ip")" \
+    "$(json_value "$chatgpt_code")" \
+    "${remote_10800_stale_socket_count:-0}" >> "$INCIDENT_INDEX_FILE"
+
+  {
+    printf 'EPOCH=%s\n' "$epoch"
+    printf 'CAUSE=%s\n' "$cause"
+    printf 'INCIDENT_ID=%s\n' "$incident_id"
+    printf 'INCIDENT_PATH=%s\n' "$incident_path"
+  } > "$INCIDENT_LAST_FILE"
+}
+
 sample() {
   rotate_if_needed
 
@@ -494,6 +641,8 @@ TRAFFIC_RATE_HUMAN=$traffic_rate_human
 TRAFFIC_STATUS=$traffic_status
 EOF
 
+  capture_incident_if_needed
+
   printf '{'
   printf '"ts":"%s",' "$(json_value "$ts")"
   printf '"epoch":%s,' "$epoch"
@@ -576,6 +725,12 @@ case "${1:-sample}" in
   tail)
     tail -n "${2:-80}" "$LOG_FILE"
     ;;
+  incidents)
+    tail -n "${2:-20}" "$INCIDENT_INDEX_FILE"
+    ;;
+  incident-path)
+    printf '%s\n' "$INCIDENT_DIR"
+    ;;
   path)
     printf '%s\n' "$LOG_FILE"
     ;;
@@ -583,7 +738,7 @@ case "${1:-sample}" in
     monitor_self_test
     ;;
   *)
-    echo "Usage: codex-gcp-monitor [sample|status|tail [n]|path|self-test]" >&2
+    echo "Usage: codex-gcp-monitor [sample|status|tail [n]|incidents [n]|incident-path|path|self-test]" >&2
     exit 2
     ;;
 esac

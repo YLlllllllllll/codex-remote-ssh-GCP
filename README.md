@@ -15,28 +15,26 @@ remote Codex -> remote 127.0.0.1:10800 HTTP
 
 The menu-bar app reads `/tmp/kinit-refresh.status` and exposes:
 
-- `修复 GCP`: one-shot forced cleanup, rebuild, and validation for the remote Codex GCP path.
-- `验证 GCP`: read-only validation of local `1080/7890`, remote `10800`, the GCP egress IP, and the ChatGPT Codex endpoint.
-- `诊断 GCP`: writes the local listener state, remote `10800` state, wrapper/config drift, app-server environment, and recent logs to `~/.codex-gcp-tunnel/gcp-diagnose-latest.log`.
-- `触发 Auto-Heal`: runs one auto-heal decision cycle without bypassing the consecutive-failure and cooldown guards.
-- `查看 Auto-Heal 状态`: writes the latest auto-heal decision and log tail to `~/.codex-gcp-tunnel/autoheal-status-latest.log`.
+- `智能修复`: samples current state, verifies the local official Codex app/config, then chooses the smallest targeted repair for Cursor SSH, local `1080`, local `7890`, remote `10800`, or version/wrapper drift.
 - `登录/更新 kinit`: prompts once for the Kerberos password, saves it to macOS Keychain, then verifies SSH.
-- `刷新 SSH`: refresh/verify Kerberos and company SSH only.
-- `重置 Cursor SSH`: runs the independent `cursor-remote-reset` helper so Cursor can reconnect, without touching Codex GCP or quitting the Cursor app.
 - `保持唤醒` / `关闭防休眠`: toggles the LaunchAgent-backed stay-awake helper.
+- `Codex Sessions`: expands to remote `codex exec`, `10800`, and app-server session details.
+- `高级`: contains read-only GCP validation, diagnosis, incident logs, auto-heal controls, SSH refresh, and manual Cursor SSH reset.
 
-`修复 GCP` runs the deep one-shot repair path. It compares the local and remote Codex CLI versions, installs the local version on the remote when they drift, rewrites the remote `10800` proxy wrappers after npm changes, checks local TCP `TIME_WAIT` headroom, stops remote `10800` consumers before resetting local `1080/7890`, lets local TCP pressure settle, rebuilds the full SSH chain, and finishes with `openai-ok`. If final validation itself creates a `10800` socket storm, it captures socket/TCP state, performs one isolated rebuild, and retries validation. It removes stale `codex exec` workers older than `STALE_CODEX_EXEC_MIN_AGE`, stale SSH tunnel sessions, and stale app-server/proxy state. It does not blindly kill every Codex process, so fresh real work is not treated as disposable.
+`智能修复` is the normal button. It first checks whether local Cursor Remote SSH has a stuck install/tunnel process group and resets only that group when needed. It then runs `codex-gcp-monitor sample`, reads `monitor-latest.env`, and maps the failure cause to a narrow command: `repair-local-socks` for local `1080`, `repair-local-http` for local `7890`, `repair-remote-forward` for remote `10800`/ChatGPT data-plane failures, and `repair-remote-sockets` for excessive stale remote `10800` sockets. It only escalates to `deep-repair` when the narrow repair and `repair-fast` do not recover the path, or when local/remote Codex version, default model, or wrapper checks detect drift.
 
-Cursor Remote SSH is deliberately separate from Codex GCP. `修复 GCP`, `remote-gcp`, and auto-heal do not reset Cursor; `重置 Cursor SSH` does not repair, sample, or stop Codex GCP.
+The local official Codex check verifies `/Applications/Codex.app` is signed by OpenAI, the `codex` CLI points at `/Applications/Codex.app/Contents/Resources/codex`, and `~/.codex/config.toml` does not contain provider overrides such as `model_provider`, `model_providers`, `base_url`, `OPENAI_BASE_URL`, ModelHub/Azure endpoints, `CODEX_HOME=~/.codex-modelhub`, or legacy `18080/18081` proxy state. A notification hook path under `.codex-modelhub` is not treated as provider pollution. If a shell launches with `CODEX_HOME=~/.codex-modelhub`, the check logs that as a warning because Codex CLI from that shell will read the modelhub home instead of the official `~/.codex` home.
 
-When `修复 GCP` succeeds it writes `~/.codex-gcp-tunnel/gcp.enabled`. `stop-gcp` removes that marker. The auto-heal LaunchAgent uses this marker plus the live listener state to decide whether GCP was meant to be on, so it can repair a broken open path without reopening GCP after you intentionally stopped it.
+Cursor Remote SSH remains separate from Codex GCP. The independent `cursor-remote-reset` helper only resets Cursor Remote SSH process groups; it does not repair, sample, or stop Codex GCP. `智能修复` only calls it when the status probe sees stuck Cursor Remote SSH install/tunnel groups.
+
+When `智能修复` succeeds it writes `~/.codex-gcp-tunnel/gcp.enabled`. `stop-gcp` removes that marker. The auto-heal LaunchAgent uses this marker plus the live listener state to decide whether GCP was meant to be on, so it can repair a broken open path without reopening GCP after you intentionally stopped it.
 
 The menu also shows `Codex Sessions: N`. Expand that item to compare the monitor's remote `codex exec` workers against the work you expect to be running. The submenu lists PID, parent PID, age, CPU, memory, and command summary, with buttons to open or copy the latest detail log.
 
-The `修复 GCP` menu title also shows read-only GCP traffic counters from the passive monitor:
+The `智能修复` menu title also shows read-only GCP traffic counters from the passive monitor:
 
 ```text
-修复 GCP    流量 今日 12.3 MiB / 24h 18.7 MiB / 当前 32.0 KiB/s
+智能修复    流量 今日 12.3 MiB / 24h 18.7 MiB / 当前 32.0 KiB/s
 ```
 
 The displayed total is RX+TX on the GCP VM interface. It is meant as an anomaly indicator: normal text-only Codex usage should stay far below GiB/day; multi-GiB/day means stale sessions or reconnect loops are likely.
@@ -63,8 +61,9 @@ By default the helper requests a `24h` Kerberos ticket with a `7d` renewable win
 
 ```bash
 kinit-refresh status
-kinit-refresh --dry-run remote-gcp
+kinit-refresh --dry-run smart-repair
 kinit-refresh ssh-only
+kinit-refresh smart-repair
 kinit-refresh remote-gcp
 kinit-refresh stop-gcp
 kinit-refresh log
@@ -75,6 +74,11 @@ codex-gcp-remote diagnose
 codex-gcp-remote limit-egress
 codex-gcp-remote clean-workers
 codex-gcp-remote traffic-sample 20
+codex-gcp-remote repair-local-socks
+codex-gcp-remote repair-local-http
+codex-gcp-remote repair-remote-forward
+codex-gcp-remote repair-remote-sockets
+codex-gcp-remote version-status
 codex-gcp-remote deep-repair
 codex-gcp-remote clean-repair-fast
 codex-gcp-remote verify-fast
@@ -101,6 +105,8 @@ Common commands:
 ```bash
 codex-gcp-monitor status
 codex-gcp-monitor tail
+codex-gcp-monitor incidents
+codex-gcp-monitor incident-path
 codex-gcp-monitor path
 ```
 
@@ -111,13 +117,23 @@ monitor.jsonl
 monitor-latest.env
 active-sessions.txt
 autoheal.log
+incidents/
 ```
+
+When a sample fails, `codex-gcp-monitor` writes a durable incident bundle under
+`~/.codex-gcp-tunnel/incidents/`. Each bundle includes the failing
+`monitor-latest.env`, session details, local route/proxy state, local
+`1080/7890` TCP states, launchd state, direct and proxied reachability probes,
+remote `10800` socket state, and tails of the monitor, auto-heal, and SOCKS
+logs. `incidents/incidents.jsonl` is append-only and is not rotated with
+`monitor.jsonl`, so transient failures can be analyzed later without manually
+reproducing them.
 
 ## Auto-Heal
 
 `codex-gcp-autoheal` is installed as a separate LaunchAgent and runs every 60 seconds. It is intentionally separate from the passive monitor.
 
-It runs `kinit-refresh remote-gcp` only when all of these are true:
+It runs a targeted repair only when all of these are true:
 
 - auto-heal is enabled with `CODEX_GCP_AUTOHEAL_ENABLED=1`
 - the latest monitor sample is fresh
@@ -134,7 +150,11 @@ AUTOHEAL_MIN_CONSECUTIVE_FAILS=2
 AUTOHEAL_COOLDOWN_SECONDS=900
 AUTOHEAL_MAX_SAMPLE_AGE_SECONDS=300
 AUTOHEAL_REPAIR_MODE=remote-gcp
+AUTOHEAL_STALE_SOCKET_THRESHOLD=20
+AUTOHEAL_ALLOW_APP_SERVER_RESTART=0
 ```
+
+With `AUTOHEAL_ALLOW_APP_SERVER_RESTART=0`, remote `10800` socket storms and `chatgpt_unreachable_000` use `codex-gcp-remote repair-remote-sockets`, which rebuilds only the forward/socket layer and leaves Codex app-server processes running. Setting `AUTOHEAL_ALLOW_APP_SERVER_RESTART=1` allows the heavier `reset-socket-storm` path.
 
 Disable it locally by setting `CODEX_GCP_AUTOHEAL_ENABLED=0` in `~/.config/codex-gcp-refresh/config.env`.
 
@@ -167,7 +187,7 @@ This one is intentionally named as live CI because it briefly opens the GCP egre
 Preview live or destructive flows first with `--dry-run`:
 
 ```bash
-kinit-refresh --dry-run remote-gcp
+kinit-refresh --dry-run smart-repair
 codex-gcp-remote --dry-run clean-repair-fast
 codex-gcp-remote --dry-run deep-repair
 scripts/live-egress-ci.sh --dry-run

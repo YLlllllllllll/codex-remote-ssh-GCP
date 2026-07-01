@@ -3,7 +3,7 @@
 #
 # 用法:
 #   kinit-refresh           # 刷新 ticket
-#   kinit-refresh --dry-run remote-gcp  # 预览会执行的 GCP 修复动作
+#   kinit-refresh --dry-run smart-repair  # 预览智能修复会执行的动作
 #   kinit-refresh status    # 查看当前 ticket 状态
 #   kinit-refresh log       # 查看最近的自动刷新日志
 #   kinit-refresh save-password  # 保存 kinit 密码到 macOS Keychain
@@ -16,7 +16,7 @@ LOCAL_HOME="$(dscl . -read "/Users/${LOCAL_USER}" NFSHomeDirectory 2>/dev/null |
 LOCAL_HOME="${LOCAL_HOME:-$HOME}"
 export HOME="$LOCAL_HOME"
 
-export PATH="$LOCAL_HOME/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/opt/homebrew/share/google-cloud-sdk/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+export PATH="$LOCAL_HOME/bin:$LOCAL_HOME/.local/bin:/Applications/Codex.app/Contents/Resources:/opt/homebrew/bin:/opt/homebrew/sbin:/opt/homebrew/share/google-cloud-sdk/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 CONFIG_FILE="${KINIT_REFRESH_CONFIG:-$LOCAL_HOME/.config/codex-gcp-refresh/config.env}"
 if [ -f "$CONFIG_FILE" ]; then
@@ -47,8 +47,13 @@ if [ -z "$JUMP_PROXY_HOST" ] && [[ "$JUMP_PROXY_SERVICE" == host/*@* ]]; then
     JUMP_PROXY_HOST="${JUMP_PROXY_HOST%@*}"
 fi
 CODEX_REFRESH_SCRIPT="${CODEX_REFRESH_SCRIPT:-$LOCAL_HOME/bin/codex-gcp-remote}"
+CODEX_MONITOR_SCRIPT="${CODEX_MONITOR_SCRIPT:-$LOCAL_HOME/bin/codex-gcp-monitor}"
+CURSOR_RESET_SCRIPT="${CURSOR_RESET_SCRIPT:-$LOCAL_HOME/bin/cursor-remote-reset}"
 STATE_DIR="${STATE_DIR:-$LOCAL_HOME/.codex-gcp-tunnel}"
 GCP_ENABLED_FILE="${GCP_ENABLED_FILE:-$STATE_DIR/gcp.enabled}"
+MONITOR_LATEST_FILE="${MONITOR_LATEST_FILE:-$STATE_DIR/monitor-latest.env}"
+SMART_REPAIR_STALE_SOCKET_THRESHOLD="${SMART_REPAIR_STALE_SOCKET_THRESHOLD:-20}"
+SMART_REPAIR_CHECK_VERSION="${SMART_REPAIR_CHECK_VERSION:-1}"
 DRY_RUN="${KINIT_REFRESH_DRY_RUN:-0}"
 
 if [ "${1:-}" = "--dry-run" ]; then
@@ -354,6 +359,24 @@ log_command_output() {
     fi
 }
 
+log_inline_output() {
+    local line
+
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        log "  ${line}"
+    done <<< "$1"
+}
+
+monitor_value() {
+    local key=$1
+    awk -F= -v key="$key" '$1 == key { print substr($0, index($0, "=") + 1); exit }' "$MONITOR_LATEST_FILE" 2>/dev/null || true
+}
+
+is_uint() {
+    [[ "${1:-}" =~ ^[0-9]+$ ]]
+}
+
 verify_ssh_chain() {
     log "预取跳板服务票据: ${JUMP_PROXY_SERVICE}"
     run_with_timeout "$COMMAND_TIMEOUT_SECONDS" /usr/bin/kgetcred "$JUMP_PROXY_SERVICE"
@@ -455,6 +478,368 @@ verify_codex_chain_clean_fast() {
     return 0
 }
 
+check_local_codex_official() {
+    local app_path="/Applications/Codex.app"
+    local codex_path target signature config rc
+
+    rc=0
+    log "Smart-Repair: 检查本地 Codex App/CLI 官方性与 provider 污染"
+
+    codex_path="$(command -v codex 2>/dev/null || true)"
+    if [ -z "$codex_path" ]; then
+        log "警告: PATH 中找不到 codex"
+        rc=1
+    else
+        target="$(readlink "$codex_path" 2>/dev/null || printf '%s' "$codex_path")"
+        log "  codex path=${codex_path} target=${target}"
+        case "$target" in
+            /Applications/Codex.app/Contents/Resources/codex|"$app_path"/Contents/Resources/codex)
+                ;;
+            *)
+                log "警告: codex CLI 不是来自 /Applications/Codex.app/Contents/Resources/codex"
+                rc=1
+                ;;
+        esac
+    fi
+
+    if [ ! -d "$app_path" ]; then
+        log "警告: ${app_path} 不存在"
+        rc=1
+    else
+        signature="$(codesign -dv --verbose=4 "$app_path" 2>&1 || true)"
+        if ! grep -q 'Identifier=com.openai.codex' <<< "$signature"; then
+            log "警告: Codex.app bundle identifier 不是 com.openai.codex"
+            rc=1
+        fi
+        if ! grep -q 'Authority=Developer ID Application: OpenAI OpCo, LLC' <<< "$signature"; then
+            log "警告: Codex.app 签名不是 OpenAI OpCo, LLC"
+            rc=1
+        fi
+        if ! spctl --assess --type execute "$app_path" >/dev/null 2>&1; then
+            log "警告: Codex.app 未通过 macOS notarized Developer ID 校验"
+            rc=1
+        fi
+    fi
+
+    config="$LOCAL_HOME/.codex/config.toml"
+    if [ -f "$config" ]; then
+        if grep -Eiq '^[[:space:]]*model_provider[[:space:]]*=|^[[:space:]]*\[model_providers\.|^[[:space:]]*base_url[[:space:]]*=|OPENAI_BASE_URL|aidp\.bytedance\.net|^[[:space:]]*CODEX_HOME[[:space:]]*=.*codex-modelhub|127\.0\.0\.1:18080|127\.0\.0\.1:18081|custom-provider' "$config"; then
+            log "警告: ${config} 存在 custom/modelhub/provider 相关配置"
+            rc=1
+        else
+            log "  ${config} 未发现 modelhub/custom provider 污染"
+        fi
+    fi
+
+    case "${CODEX_HOME:-}" in
+        ""|"$LOCAL_HOME/.codex")
+            ;;
+        *)
+            log "警告: 当前进程环境 CODEX_HOME=${CODEX_HOME}; 从该 shell 启动 codex 会读取非官方家目录"
+            ;;
+    esac
+
+    return "$rc"
+}
+
+run_monitor_sample() {
+    if [ ! -x "$CODEX_MONITOR_SCRIPT" ]; then
+        log "跳过 monitor sample, 脚本不存在或不可执行: $CODEX_MONITOR_SCRIPT"
+        return 127
+    fi
+
+    log "采样 Codex GCP 状态: ${CODEX_MONITOR_SCRIPT} sample"
+    run_with_timeout "$CODEX_TIMEOUT_SECONDS" "$CODEX_MONITOR_SCRIPT" sample
+}
+
+run_codex_repair_command() {
+    local command=$1
+    local reason=$2
+    local rc
+
+    if [ ! -x "$CODEX_REFRESH_SCRIPT" ]; then
+        log "失败, Codex 修复脚本不存在或不可执行: $CODEX_REFRESH_SCRIPT"
+        return 127
+    fi
+
+    log "Smart-Repair 选择: ${command} (${reason})"
+    write_status "running" "ok" "checking" "checking" "$(klist 2>/dev/null | awk '/krbtgt/ {print $5, $6, $7, $8; exit}')" "智能修复: ${reason}"
+    run_with_timeout "$CODEX_TIMEOUT_SECONDS" "$CODEX_REFRESH_SCRIPT" "$command"
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        log "Smart-Repair 步骤失败: ${command}, 退出码 ${rc}"
+    fi
+    return "$rc"
+}
+
+smart_refresh_ssh_if_needed() {
+    local exp rc
+    exp=$(klist 2>/dev/null | awk '/krbtgt/ {print $5, $6, $7, $8; exit}')
+
+    if keychain_password_available; then
+        log "Smart-Repair: 检测到 Keychain kinit 密码, 刷新 Kerberos ticket"
+        run_kinit_with_timeout
+        rc=$?
+        if [ "$rc" -ne 0 ]; then
+            log "Smart-Repair: kinit 刷新失败, 退出码 ${rc}"
+            write_status "fail" "fail" "unknown" "unknown" "$exp" "智能修复失败: kinit 刷新失败"
+            return "$rc"
+        fi
+        exp=$(klist 2>/dev/null | awk '/krbtgt/ {print $5, $6, $7, $8; exit}')
+    elif ! klist -s 2>/dev/null; then
+        log "Smart-Repair: 当前无有效 Kerberos ticket, 且 Keychain 未保存密码"
+        write_status "fail" "no_ticket" "unknown" "unknown" "$exp" "智能修复失败: 无有效 Kerberos ticket"
+        return 1
+    else
+        log "Smart-Repair: 使用当前有效 Kerberos ticket 验证 SSH"
+    fi
+
+    verify_ssh_chain
+}
+
+smart_reset_cursor_if_needed() {
+    local output rc
+
+    [ -x "$CURSOR_RESET_SCRIPT" ] || return 0
+    output="$("$CURSOR_RESET_SCRIPT" status 2>&1 || true)"
+    log "Smart-Repair: Cursor Remote SSH 状态"
+    log_inline_output "$output"
+    if ! grep -q 'would terminate Cursor Remote SSH process group' <<< "$output"; then
+        return 0
+    fi
+
+    log "Smart-Repair: 发现卡住的 Cursor Remote SSH 进程组, 只重置 Cursor SSH"
+    run_with_timeout "$COMMAND_TIMEOUT_SECONDS" "$CURSOR_RESET_SCRIPT" reset
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+        SMART_REPAIR_CURSOR_RESET=1
+    fi
+    return "$rc"
+}
+
+smart_monitor_status_message() {
+    printf 'status=%s cause=%s local1080=%s local7890=%s remote10800=%s stale10800=%s chatgpt=%s' \
+        "$(monitor_value STATUS)" \
+        "$(monitor_value CAUSE)" \
+        "$(monitor_value LOCAL_1080_COUNT)" \
+        "$(monitor_value LOCAL_7890_COUNT)" \
+        "$(monitor_value REMOTE_10800_COUNT)" \
+        "$(monitor_value REMOTE_10800_STALE_SOCKET_COUNT)" \
+        "$(monitor_value CHATGPT_CODE)"
+}
+
+smart_sample_and_log() {
+    local rc
+
+    run_monitor_sample
+    rc=$?
+    log "Smart-Repair monitor: $(smart_monitor_status_message)"
+    return "$rc"
+}
+
+smart_select_repair_command() {
+    local status cause stale_count
+    status="$(monitor_value STATUS)"
+    cause="$(monitor_value CAUSE)"
+    stale_count="$(monitor_value REMOTE_10800_STALE_SOCKET_COUNT)"
+    is_uint "$stale_count" || stale_count=0
+
+    if [ "$status" = "ok" ] && [ "$stale_count" -ge "$SMART_REPAIR_STALE_SOCKET_THRESHOLD" ]; then
+        SMART_REPAIR_COMMAND="repair-remote-sockets"
+        SMART_REPAIR_REASON="10800 stale socket 数过高 (${stale_count}), 只重建远端 forward/socket 层"
+        return 0
+    fi
+
+    case "$cause" in
+        ok)
+            SMART_REPAIR_COMMAND="none"
+            SMART_REPAIR_REASON="monitor 已经为 ok, 不重建 GCP 链路"
+            ;;
+        gcp_tcp_fail|local_1080_missing)
+            SMART_REPAIR_COMMAND="repair-local-socks"
+            SMART_REPAIR_REASON="本地 1080 SOCKS/GCP TCP 异常, 只修复本地 SOCKS 层"
+            ;;
+        local_7890_missing|local_7890_bad_egress)
+            SMART_REPAIR_COMMAND="repair-local-http"
+            SMART_REPAIR_REASON="本地 7890 HTTP 代理异常, 只修复本地 HTTP 层"
+            ;;
+        remote_10800_missing|remote_10800_bad_egress|chatgpt_unreachable_*)
+            SMART_REPAIR_COMMAND="repair-remote-forward"
+            SMART_REPAIR_REASON="远端 10800 或 ChatGPT data plane 异常, 只修复远端 forward 层"
+            ;;
+        remote_ssh_fail_*)
+            SMART_REPAIR_COMMAND="ssh-refresh"
+            SMART_REPAIR_REASON="远端 SSH 采样失败, 刷新 Kerberos/SSH 后重新采样"
+            ;;
+        *)
+            SMART_REPAIR_COMMAND="repair-fast"
+            SMART_REPAIR_REASON="未知 monitor cause=${cause:-empty}, 使用保守快速修复"
+            ;;
+    esac
+}
+
+smart_verify_versions_if_needed() {
+    local rc
+
+    [ "$SMART_REPAIR_CHECK_VERSION" = "1" ] || return 0
+    if [ ! -x "$CODEX_REFRESH_SCRIPT" ]; then
+        return 127
+    fi
+
+    log "Smart-Repair: 检查本地/远端 Codex 版本和 remote wrapper"
+    run_with_timeout "$CODEX_TIMEOUT_SECONDS" "$CODEX_REFRESH_SCRIPT" version-status
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+        return 0
+    fi
+
+    log "Smart-Repair: 检测到版本或 wrapper drift, 先执行轻量 wrapper 修复"
+    run_codex_repair_command repair-wrappers "本地/远端 Codex wrapper 或 proxy.env 漂移"
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+        return 0
+    fi
+
+    log "Smart-Repair: wrapper 修复后仍不一致, 才升级到 deep-repair"
+    run_codex_repair_command deep-repair "本地/远端 Codex 版本不一致或 wrapper 修复失败"
+}
+
+smart_repair() {
+    local exp rc command status cause
+
+    SMART_REPAIR_CURSOR_RESET=0
+    SMART_REPAIR_COMMAND=""
+    SMART_REPAIR_REASON=""
+    exp=$(klist 2>/dev/null | awk '/krbtgt/ {print $5, $6, $7, $8; exit}')
+    log "kinit-refresh Smart-Repair 启动 (codex_timeout=${CODEX_TIMEOUT_SECONDS}s, ssh_probe=${SSH_PROBE_TARGET})"
+    write_status "running" "checking" "checking" "checking" "$exp" "正在智能诊断并选择最小修复动作"
+
+    smart_reset_cursor_if_needed
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        write_status "fail" "unknown" "unknown" "unknown" "$exp" "智能修复失败: Cursor SSH reset 退出码 ${rc}"
+        return "$rc"
+    fi
+
+    if ! check_local_codex_official; then
+        log "Smart-Repair: 本地 Codex 官方性检查存在警告, 继续检查 GCP 链路"
+    fi
+
+    smart_sample_and_log || true
+    smart_select_repair_command
+    command="$SMART_REPAIR_COMMAND"
+    if [ "$command" = "ssh-refresh" ]; then
+        write_status "running" "checking" "unknown" "unknown" "$exp" "智能修复: SSH 采样失败, 正在刷新 Kerberos/SSH"
+        smart_refresh_ssh_if_needed
+        rc=$?
+        if [ "$rc" -ne 0 ]; then
+            write_status "fail" "fail" "unknown" "unknown" "$exp" "智能修复失败: SSH 链路不可用"
+            return "$rc"
+        fi
+        smart_sample_and_log || true
+        smart_select_repair_command
+        command="$SMART_REPAIR_COMMAND"
+    fi
+
+    if [ "$command" != "none" ]; then
+        run_codex_repair_command "$command" "$SMART_REPAIR_REASON"
+        rc=$?
+        if [ "$rc" -ne 0 ]; then
+            case "$(monitor_value CAUSE)" in
+                gcp_tcp_fail)
+                    write_status "fail" "ok" "fail" "fail" "$exp" "智能修复失败: GCP TCP 不通, 需要检查本地网络/VPN/GCP"
+                    return "$rc"
+                    ;;
+            esac
+            run_codex_repair_command repair-fast "目标修复失败, 回退快速修复"
+            rc=$?
+            if [ "$rc" -ne 0 ]; then
+                run_codex_repair_command deep-repair "快速修复仍失败, 才执行深度修复"
+                rc=$?
+                [ "$rc" -eq 0 ] || return "$rc"
+            fi
+        fi
+    else
+        log "Smart-Repair: ${SMART_REPAIR_REASON}"
+    fi
+
+    smart_sample_and_log || true
+    status="$(monitor_value STATUS)"
+    cause="$(monitor_value CAUSE)"
+    if [ "$status" != "ok" ]; then
+        run_codex_repair_command repair-fast "采样仍未恢复 (${cause:-unknown}), 回退快速修复"
+        rc=$?
+        if [ "$rc" -ne 0 ]; then
+            run_codex_repair_command deep-repair "快速修复后仍未恢复, 才执行深度修复"
+            rc=$?
+            [ "$rc" -eq 0 ] || return "$rc"
+        fi
+        smart_sample_and_log || true
+        status="$(monitor_value STATUS)"
+        cause="$(monitor_value CAUSE)"
+    fi
+
+    if [ "$status" = "ok" ]; then
+        local stale_count
+        stale_count="$(monitor_value REMOTE_10800_STALE_SOCKET_COUNT)"
+        is_uint "$stale_count" || stale_count=0
+        if [ "$stale_count" -ge "$SMART_REPAIR_STALE_SOCKET_THRESHOLD" ]; then
+            run_codex_repair_command repair-remote-sockets "GCP 已恢复但远端 10800 stale socket 仍过高 (${stale_count})"
+            rc=$?
+            [ "$rc" -eq 0 ] || return "$rc"
+            smart_sample_and_log || true
+            status="$(monitor_value STATUS)"
+            cause="$(monitor_value CAUSE)"
+        fi
+    fi
+
+    if [ "$status" = "ok" ]; then
+        smart_verify_versions_if_needed
+        rc=$?
+        if [ "$rc" -ne 0 ]; then
+            write_status "fail" "ok" "fail" "fail" "$exp" "智能修复失败: 版本/wrapper 深度修复失败"
+            return "$rc"
+        fi
+        smart_sample_and_log || true
+    fi
+
+    status="$(monitor_value STATUS)"
+    cause="$(monitor_value CAUSE)"
+    exp=$(klist 2>/dev/null | awk '/krbtgt/ {print $5, $6, $7, $8; exit}')
+    if [ "$status" = "ok" ]; then
+        mark_gcp_enabled
+        if [ "$SMART_REPAIR_CURSOR_RESET" = "1" ]; then
+            write_status "ok" "ok" "ok" "ok" "$exp" "智能修复完成: Cursor SSH 已重置, GCP 链路正常"
+        else
+            write_status "ok" "ok" "ok" "ok" "$exp" "智能修复完成: GCP 链路正常"
+        fi
+        log "Smart-Repair 成功: $(smart_monitor_status_message)"
+        return 0
+    fi
+
+    case "$cause" in
+        remote_10800_*|chatgpt_unreachable_*)
+            run_codex_repair_command repair-remote-sockets "最终采样仍显示远端 10800/ChatGPT 异常 (${cause:-unknown}), 再次只重置 forward/socket 层"
+            rc=$?
+            [ "$rc" -eq 0 ] || return "$rc"
+            smart_sample_and_log || true
+            status="$(monitor_value STATUS)"
+            cause="$(monitor_value CAUSE)"
+            exp=$(klist 2>/dev/null | awk '/krbtgt/ {print $5, $6, $7, $8; exit}')
+            if [ "$status" = "ok" ]; then
+                mark_gcp_enabled
+                write_status "ok" "ok" "ok" "ok" "$exp" "智能修复完成: 远端 10800 已重建, GCP 链路正常"
+                log "Smart-Repair 成功: $(smart_monitor_status_message)"
+                return 0
+            fi
+            ;;
+    esac
+
+    log "Smart-Repair 最终失败: status=${status:-empty}, cause=${cause:-empty}"
+    write_status "fail" "ok" "fail" "fail" "$exp" "智能修复失败: ${cause:-unknown}"
+    return 1
+}
+
 stop_codex_gcp_egress() {
     if [ ! -x "$CODEX_REFRESH_SCRIPT" ]; then
         log "失败, Codex 修复脚本不存在或不可执行: $CODEX_REFRESH_SCRIPT"
@@ -481,6 +866,22 @@ dry_run_plan() {
     echo "No Kerberos refresh, SSH probe, status write, marker update, proxy repair, or process cleanup will run."
 
     case "$mode" in
+        smart-repair)
+            cat <<EOF
+Would:
+  - check for stuck Cursor Remote SSH install/tunnel process groups and reset only those if present
+  - verify local Codex.app is signed by OpenAI and ~/.codex has no custom/modelhub provider override
+  - run codex-gcp-monitor sample and read ${MONITOR_LATEST_FILE}
+  - refresh Kerberos/SSH only if monitor reports a remote SSH failure
+  - choose the smallest matching GCP repair:
+      local_1080_missing/gcp_tcp_fail        -> codex-gcp-remote --dry-run repair-local-socks
+      local_7890_missing/local_7890_bad     -> codex-gcp-remote --dry-run repair-local-http
+      remote_10800/chatgpt data-plane issue -> codex-gcp-remote --dry-run repair-remote-forward
+      many stale remote 10800 sockets       -> codex-gcp-remote --dry-run repair-remote-sockets
+      version/wrapper drift                 -> codex-gcp-remote --dry-run deep-repair
+  - avoid restarting remote Codex app-server unless deep repair is reached after smaller fixes fail
+EOF
+            ;;
         stop-gcp)
             echo "Would run: codex-gcp-remote --dry-run limit-egress"
             CODEX_GCP_DRY_RUN=1 "$CODEX_REFRESH_SCRIPT" --dry-run limit-egress 2>/dev/null || true
@@ -546,6 +947,9 @@ case "${1:-}" in
     ssh|ssh-only|refresh-ssh)
         MODE="ssh-only"
         ;;
+    smart|smart-repair|one-click|oneclick|fix|repair)
+        MODE="smart-repair"
+        ;;
     stop-gcp|stop-egress|limit-gcp|limit-egress)
         MODE="stop-gcp"
         ;;
@@ -559,7 +963,7 @@ case "${1:-}" in
         MODE="full"
         ;;
     *)
-        echo "Usage: kinit-refresh [--dry-run] [status|log|save-password|delete-password|ssh-only|remote-gcp|stop-gcp]" >&2
+        echo "Usage: kinit-refresh [--dry-run] [status|log|save-password|delete-password|ssh-only|smart-repair|remote-gcp|stop-gcp]" >&2
         exit 2
         ;;
 esac
@@ -578,6 +982,17 @@ if ! acquire_lock; then
 fi
 
 trap cleanup EXIT
+
+if [ "$MODE" = "smart-repair" ]; then
+    smart_repair
+    RC=$?
+    if [ "$RC" -eq 0 ]; then
+        [ -t 1 ] && echo "智能修复完成"
+    else
+        [ -t 1 ] && echo "智能修复失败 (exit ${RC}), 详见 ${LOG_FILE}"
+    fi
+    exit "$RC"
+fi
 
 if [ "$MODE" = "stop-gcp" ]; then
     EXP=$(klist 2>/dev/null | awk '/krbtgt/ {print $5, $6, $7, $8; exit}')
