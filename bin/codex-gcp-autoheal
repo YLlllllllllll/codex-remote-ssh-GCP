@@ -206,19 +206,6 @@ should_autoheal() {
     printf 'skip: stale sockets above threshold are not dangerous enough stale=%s danger_stale=%s active=%s threshold=%s\n' "$stale_sockets" "$danger_stale_sockets" "$active_sockets" "$AUTOHEAL_STALE_SOCKET_THRESHOLD"
     return 1
   fi
-  if [[ "$remote_count" -gt 0 && "$local_http_ip" == "${GCP_EXPECTED_IP:-}" ]]; then
-    case "$cause" in
-      remote_10800_bad_egress|chatgpt_unreachable_000|chatgpt_unreachable_empty)
-        remaining="$(number_or_zero "$(cooldown_remaining "$AUTOHEAL_SOCKET_STORM_LAST_FILE" "$AUTOHEAL_SOCKET_STORM_COOLDOWN_SECONDS")")"
-        if [[ "$remaining" -gt 0 ]]; then
-          printf 'skip: socket-storm cooldown %ss remaining\n' "$remaining"
-          return 1
-        fi
-        printf 'heal: cause=remote_10800_data_plane_repair_remote_sockets monitor_cause=%s stale_sockets=%s\n' "$cause" "$stale_sockets"
-        return 0
-        ;;
-    esac
-  fi
   [[ "$status" == "fail" ]] || {
     printf 'skip: monitor status %s\n' "${status:-unknown}"
     return 1
@@ -238,6 +225,20 @@ should_autoheal() {
   if [[ "$remaining" -gt 0 ]]; then
     printf 'skip: cooldown %ss remaining\n' "$remaining"
     return 1
+  fi
+
+  if [[ "$remote_count" -gt 0 && "$local_http_ip" == "${GCP_EXPECTED_IP:-}" ]]; then
+    case "$cause" in
+      remote_10800_bad_egress|chatgpt_unreachable_000|chatgpt_unreachable_empty)
+        remaining="$(number_or_zero "$(cooldown_remaining "$AUTOHEAL_SOCKET_STORM_LAST_FILE" "$AUTOHEAL_SOCKET_STORM_COOLDOWN_SECONDS")")"
+        if [[ "$remaining" -gt 0 ]]; then
+          printf 'skip: socket-storm cooldown %ss remaining\n' "$remaining"
+          return 1
+        fi
+        printf 'heal: cause=remote_10800_data_plane_repair_remote_sockets monitor_cause=%s stale_sockets=%s consecutive_failures=%s\n' "$cause" "$stale_sockets" "$fails"
+        return 0
+        ;;
+    esac
   fi
 
   printf 'heal: cause=%s consecutive_failures=%s\n' "$cause" "$fails"

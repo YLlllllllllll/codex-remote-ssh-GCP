@@ -96,12 +96,19 @@ curl_local_http_ip() {
 
 tcp_check() {
   local bind_address
+  if nc -vz -G "$MONITOR_CONNECT_TIMEOUT" "$GCP_HOST" "$GCP_PORT" >/dev/null 2>&1; then
+    printf ok
+    return 0
+  fi
+
   bind_address="$(gcp_bind_address)"
   if [[ -n "$bind_address" ]]; then
-    nc -s "$bind_address" -vz -G "$MONITOR_CONNECT_TIMEOUT" "$GCP_HOST" "$GCP_PORT" >/dev/null 2>&1 && printf ok || printf fail
-  else
-    nc -vz -G "$MONITOR_CONNECT_TIMEOUT" "$GCP_HOST" "$GCP_PORT" >/dev/null 2>&1 && printf ok || printf fail
+    nc -s "$bind_address" -vz -G "$MONITOR_CONNECT_TIMEOUT" "$GCP_HOST" "$GCP_PORT" >/dev/null 2>&1 && {
+      printf ok
+      return 0
+    }
   fi
+  printf fail
 }
 
 gcp_counter_probe() {
@@ -476,11 +483,15 @@ capture_incident_if_needed() {
     printf '\n'
   } | section_to_file "$evidence" "local reachability probes"
   {
+    printf 'direct: '
+    nc -vz -G "$MONITOR_CONNECT_TIMEOUT" "$GCP_HOST" "$GCP_PORT" 2>&1 || true
+    printf '\nbound: '
     if [[ -n "$gcp_bind" ]]; then
       nc -s "$gcp_bind" -vz -G "$MONITOR_CONNECT_TIMEOUT" "$GCP_HOST" "$GCP_PORT" 2>&1 || true
     else
-      nc -vz -G "$MONITOR_CONNECT_TIMEOUT" "$GCP_HOST" "$GCP_PORT" 2>&1 || true
+      printf 'skipped: no bind address'
     fi
+    printf '\n'
   } | section_to_file "$evidence" "gcp tcp probe"
   {
     ssh -o BatchMode=yes -o ConnectTimeout="$MONITOR_CONNECT_TIMEOUT" -o ConnectionAttempts=1 "$REMOTE_HOST" \
