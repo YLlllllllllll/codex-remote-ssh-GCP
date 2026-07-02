@@ -98,6 +98,8 @@ It records:
 - local `7890` egress IP
 - remote `10800` listener and egress IP
 - ChatGPT endpoint HTTP code through remote `10800`
+- remote `10800` socket state split into active, total stale, dangerous stale
+  (`CLOSE-WAIT`/`FIN-WAIT`/`LAST-ACK`/`CLOSING`), and `TIME-WAIT`
 - remote app-server and SSH notty process counts
 - latest `/tmp/kinit-refresh.status`
 
@@ -155,7 +157,17 @@ AUTOHEAL_STALE_SOCKET_THRESHOLD=20
 AUTOHEAL_ALLOW_APP_SERVER_RESTART=0
 ```
 
-With `AUTOHEAL_ALLOW_APP_SERVER_RESTART=0`, remote `10800` socket storms and `chatgpt_unreachable_000` use `codex-gcp-remote repair-remote-sockets`, which rebuilds only the forward/socket layer and leaves Codex app-server processes running. Setting `AUTOHEAL_ALLOW_APP_SERVER_RESTART=1` allows the heavier `reset-socket-storm` path.
+Auto-heal uses the monitor's dangerous stale socket count, not plain `TIME-WAIT`, to avoid treating normal short-lived traffic as a socket storm. If the data plane is still healthy, it records the high socket count and skips repair rather than disrupting active Codex sessions.
+
+With `AUTOHEAL_ALLOW_APP_SERVER_RESTART=0`, eligible remote `10800` data-plane failures use `codex-gcp-remote repair-remote-sockets`, which rebuilds only the forward/socket layer and leaves Codex app-server processes running. Setting `AUTOHEAL_ALLOW_APP_SERVER_RESTART=1` allows the heavier `reset-socket-storm` path, which can interrupt active sessions and should only be used for controlled recovery windows.
+
+After changing the GCP path scripts or config, run the post-change stability gate before declaring the path stable:
+
+```bash
+codex-gcp-stability-check --duration 600 --interval 60
+```
+
+The gate runs `verify-fast`, full remote `openai-ok` validation, repeated monitor samples, dangerous stale socket checks, and local `TIME_WAIT` headroom checks.
 
 `kinit-refresh smart-repair` also checks whether a running remote Codex app-server still points at a replaced or deleted CLI binary after an update. In that case it runs `codex-gcp-remote restart-remote-app-server`, which restarts only the remote Codex runtime so the installed CLI version and the UI's running CLI version converge.
 

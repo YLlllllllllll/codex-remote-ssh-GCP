@@ -1,0 +1,247 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+LOCAL_USER="$(id -un)"
+LOCAL_HOME="${LOCAL_HOME:-$(dscl . -read "/Users/${LOCAL_USER}" NFSHomeDirectory 2>/dev/null | awk '{ print $2; exit }')}"
+LOCAL_HOME="${LOCAL_HOME:-$HOME}"
+export HOME="$LOCAL_HOME"
+
+CONFIG_FILE="${CODEX_GCP_REFRESH_CONFIG:-$LOCAL_HOME/.config/codex-gcp-refresh/config.env}"
+if [[ -f "$CONFIG_FILE" ]]; then
+  # shellcheck disable=SC1090
+  . "$CONFIG_FILE"
+fi
+
+STATE_DIR="${STATE_DIR:-$LOCAL_HOME/.codex-gcp-tunnel}"
+REMOTE_SCRIPT="${REMOTE_SCRIPT:-$LOCAL_HOME/bin/codex-gcp-remote}"
+MONITOR_SCRIPT="${MONITOR_SCRIPT:-$LOCAL_HOME/bin/codex-gcp-monitor}"
+AUTOHEAL_SCRIPT="${AUTOHEAL_SCRIPT:-$LOCAL_HOME/bin/codex-gcp-autoheal}"
+LATEST_FILE="${MONITOR_LATEST_FILE:-$STATE_DIR/monitor-latest.env}"
+REMOTE_HOST="${REMOTE_HOST:-${SSH_PROBE_TARGET:-remote-workspace.example.invalid}}"
+REMOTE_HTTP_PORT="${REMOTE_HTTP_PORT:-10800}"
+LOCAL_HTTP_PORT="${LOCAL_HTTP_PORT:-7890}"
+GCP_EXPECTED_IP="${GCP_EXPECTED_IP:-192.0.2.10}"
+AUTOHEAL_STALE_SOCKET_THRESHOLD="${AUTOHEAL_STALE_SOCKET_THRESHOLD:-20}"
+
+DURATION_SECONDS="${CODEX_GCP_STABILITY_DURATION_SECONDS:-600}"
+INTERVAL_SECONDS="${CODEX_GCP_STABILITY_INTERVAL_SECONDS:-60}"
+RUN_FULL_VERIFY=1
+MAX_LOCAL_TIME_WAIT="${CODEX_GCP_MAX_LOCAL_TIME_WAIT:-10000}"
+MAX_PROXY_TIME_WAIT="${CODEX_GCP_MAX_PROXY_TIME_WAIT:-5000}"
+OUT_DIR=""
+
+usage() {
+  cat <<EOF
+Usage: $(basename "$0") [--duration seconds] [--interval seconds] [--skip-full-verify]
+
+Post-change validation gate for the fixed Codex GCP path.
+
+Checks:
+  - verify-fast: remote 127.0.0.1:${REMOTE_HTTP_PORT} exits through ${GCP_EXPECTED_IP}
+  - verify: remote codex exec returns openai-ok, unless --skip-full-verify
+  - monitor status remains ok during the soak window
+  - remote dangerous ${REMOTE_HTTP_PORT} sockets stay below ${AUTOHEAL_STALE_SOCKET_THRESHOLD}
+  - local TCP TIME_WAIT does not approach exhaustion
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --duration)
+      DURATION_SECONDS="${2:?duration requires seconds}"
+      shift 2
+      ;;
+    --interval)
+      INTERVAL_SECONDS="${2:?interval requires seconds}"
+      shift 2
+      ;;
+    --skip-full-verify)
+      RUN_FULL_VERIFY=0
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "unknown argument: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+case "$DURATION_SECONDS" in
+  ''|*[!0-9]*) echo "duration must be an integer number of seconds" >&2; exit 2 ;;
+esac
+case "$INTERVAL_SECONDS" in
+  ''|*[!0-9]*) echo "interval must be an integer number of seconds" >&2; exit 2 ;;
+esac
+if [[ "$INTERVAL_SECONDS" -le 0 ]]; then
+  echo "interval must be > 0" >&2
+  exit 2
+fi
+
+mkdir -p "$STATE_DIR"
+OUT_DIR="$STATE_DIR/stability-$(date '+%Y%m%d-%H%M%S')"
+mkdir -p "$OUT_DIR"
+LOG_FILE="$OUT_DIR/stability.log"
+CSV_FILE="$OUT_DIR/samples.csv"
+
+log() {
+  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" | tee -a "$LOG_FILE"
+}
+
+kv_value() {
+  local key="$1"
+  awk -F= -v key="$key" '$1 == key { sub(/^[^=]*=/, ""); print; exit }' "$LATEST_FILE" 2>/dev/null || true
+}
+
+tcp_state_count() {
+  local state_name="$1"
+  netstat -anv -p tcp 2>/dev/null | awk -v want="$state_name" 'NR>2 && $6 == want { count++ } END { print count + 0 }'
+}
+
+proxy_time_wait_count() {
+  netstat -anv -p tcp 2>/dev/null | awk -v port1=".$LOCAL_HTTP_PORT" -v port2=".$REMOTE_HTTP_PORT" '
+    NR>2 && $6 == "TIME_WAIT" && ($4 ~ port1 "$" || $5 ~ port1 "$" || $4 ~ port2 "$" || $5 ~ port2 "$") { count++ }
+    END { print count + 0 }
+  '
+}
+
+remote_socket_summary() {
+  ssh -o BatchMode=yes -o ConnectTimeout=15 "$REMOTE_HOST" \
+    "ss -tan '( sport = :${REMOTE_HTTP_PORT} or dport = :${REMOTE_HTTP_PORT} )' 2>/dev/null | tail -n +2 | awk '{c[\$1]++} END{total=0; for (s in c) total+=c[s]; printf \"TOTAL=%d\", total; for (s in c) printf \" %s=%d\", s, c[s]; print \"\"}'" \
+    2>>"$LOG_FILE" || true
+}
+
+require_monitor_ok() {
+  local label="$1"
+  local status cause gcp_tcp local_ip remote_ip chat_code stale danger_stale active total close_wait fin_wait time_wait
+  status="$(kv_value STATUS)"
+  cause="$(kv_value CAUSE)"
+  gcp_tcp="$(kv_value GCP_TCP)"
+  local_ip="$(kv_value LOCAL_7890_IP)"
+  remote_ip="$(kv_value REMOTE_10800_IP)"
+  chat_code="$(kv_value CHATGPT_CODE)"
+  stale="$(kv_value REMOTE_10800_STALE_SOCKET_COUNT)"
+  danger_stale="$(kv_value REMOTE_10800_DANGER_STALE_SOCKET_COUNT)"
+  active="$(kv_value REMOTE_10800_ACTIVE_SOCKET_COUNT)"
+  total="$(kv_value REMOTE_10800_SOCKET_COUNT)"
+  close_wait="$(kv_value REMOTE_10800_CLOSE_WAIT_SOCKET_COUNT)"
+  fin_wait="$(kv_value REMOTE_10800_FIN_WAIT_SOCKET_COUNT)"
+  time_wait="$(kv_value REMOTE_10800_TIME_WAIT_SOCKET_COUNT)"
+  stale="${stale:-0}"
+  danger_stale="${danger_stale:-0}"
+  active="${active:-0}"
+  total="${total:-0}"
+  close_wait="${close_wait:-0}"
+  fin_wait="${fin_wait:-0}"
+  time_wait="${time_wait:-0}"
+
+  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+    "$(date '+%Y-%m-%dT%H:%M:%S%z')" \
+    "$label" \
+    "$status" \
+    "$cause" \
+    "$gcp_tcp" \
+    "$local_ip" \
+    "$remote_ip" \
+    "$chat_code" \
+    "$total" \
+    "$active" \
+    "$stale" \
+    "$danger_stale" \
+    "$close_wait" \
+    "$fin_wait" \
+    "$time_wait" \
+    "$(tcp_state_count TIME_WAIT)" >> "$CSV_FILE"
+
+  if [[ "$status" != "ok" ]]; then
+    log "FAIL: monitor status=$status cause=$cause"
+    return 1
+  fi
+  if [[ "$gcp_tcp" != "ok" ]]; then
+    log "FAIL: GCP TCP probe is ${gcp_tcp:-empty}; route must support rebuilding the tunnel"
+    return 1
+  fi
+  if [[ "$local_ip" != "$GCP_EXPECTED_IP" ]]; then
+    log "FAIL: local ${LOCAL_HTTP_PORT} exits as ${local_ip:-empty}, expected $GCP_EXPECTED_IP"
+    return 1
+  fi
+  if [[ "$remote_ip" != "$GCP_EXPECTED_IP" ]]; then
+    log "FAIL: remote ${REMOTE_HTTP_PORT} exits as ${remote_ip:-empty}, expected $GCP_EXPECTED_IP"
+    return 1
+  fi
+  if [[ ! "$chat_code" =~ ^(2|3|4)[0-9][0-9]$ ]]; then
+    log "FAIL: chatgpt codex endpoint code=${chat_code:-empty}"
+    return 1
+  fi
+  if [[ "$danger_stale" =~ ^[0-9]+$ && "$danger_stale" -ge "$AUTOHEAL_STALE_SOCKET_THRESHOLD" ]]; then
+    log "FAIL: remote dangerous stale sockets=$danger_stale threshold=$AUTOHEAL_STALE_SOCKET_THRESHOLD"
+    return 1
+  fi
+}
+
+require_tcp_headroom() {
+  local total_tw proxy_tw
+  total_tw="$(tcp_state_count TIME_WAIT)"
+  proxy_tw="$(proxy_time_wait_count)"
+  if [[ "$total_tw" -gt "$MAX_LOCAL_TIME_WAIT" ]]; then
+    log "FAIL: local TIME_WAIT=$total_tw max=$MAX_LOCAL_TIME_WAIT"
+    return 1
+  fi
+  if [[ "$proxy_tw" -gt "$MAX_PROXY_TIME_WAIT" ]]; then
+    log "FAIL: proxy-related TIME_WAIT=$proxy_tw max=$MAX_PROXY_TIME_WAIT"
+    return 1
+  fi
+}
+
+run_step() {
+  local name="$1"
+  shift
+  log "START: $name"
+  if "$@" >>"$LOG_FILE" 2>&1; then
+    log "PASS: $name"
+  else
+    local rc=$?
+    log "FAIL: $name rc=$rc"
+    return "$rc"
+  fi
+}
+
+{
+  printf 'ts,label,status,cause,gcp_tcp,local_7890_ip,remote_10800_ip,chatgpt_code,remote_socket_total,remote_socket_active,remote_socket_stale,remote_socket_danger,remote_socket_close_wait,remote_socket_fin_wait,remote_socket_time_wait,local_time_wait\n'
+} > "$CSV_FILE"
+
+log "Codex GCP post-change stability gate started"
+log "output_dir=$OUT_DIR duration=${DURATION_SECONDS}s interval=${INTERVAL_SECONDS}s full_verify=$RUN_FULL_VERIFY"
+
+run_step "syntax check" bash -n "$REMOTE_SCRIPT" "$MONITOR_SCRIPT" "$AUTOHEAL_SCRIPT" "$LOCAL_HOME/bin/codex-workspace-proxy"
+run_step "verify-fast" "$REMOTE_SCRIPT" verify-fast
+if [[ "$RUN_FULL_VERIFY" == "1" ]]; then
+  run_step "verify openai-ok" "$REMOTE_SCRIPT" verify
+fi
+
+run_step "monitor sample" "$MONITOR_SCRIPT" sample
+require_monitor_ok "pre-soak"
+require_tcp_headroom
+
+end_epoch=$(( $(date +%s) + DURATION_SECONDS ))
+sample_index=0
+while [[ "$(date +%s)" -lt "$end_epoch" ]]; do
+  sample_index=$((sample_index + 1))
+  sleep "$INTERVAL_SECONDS"
+  run_step "monitor sample $sample_index" "$MONITOR_SCRIPT" sample
+  require_monitor_ok "soak-$sample_index"
+  require_tcp_headroom
+  log "SOAK sample=$sample_index remote_sockets=$(remote_socket_summary) local_time_wait=$(tcp_state_count TIME_WAIT) proxy_time_wait=$(proxy_time_wait_count)"
+done
+
+run_step "final verify-fast" "$REMOTE_SCRIPT" verify-fast
+run_step "final monitor sample" "$MONITOR_SCRIPT" sample
+require_monitor_ok "post-soak"
+require_tcp_headroom
+
+log "PASS: Codex GCP stability gate complete"
+log "summary_csv=$CSV_FILE"

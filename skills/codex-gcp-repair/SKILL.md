@@ -99,6 +99,21 @@ Expected result:
 - Remote `127.0.0.1:10800` returns the configured GCP egress IP through `https://api.ipify.org`.
 - `https://chatgpt.com/backend-api/codex/responses` through remote `10800` returns a reachable HTTP status, normally `405`.
 
+After changing any GCP path script or config, run the post-change stability gate before declaring the path stable:
+
+```bash
+"$REAL_HOME/bin/codex-gcp-stability-check" --duration 600 --interval 60
+```
+
+Expected result:
+
+- `verify-fast` passes.
+- Full remote `codex exec` returns `openai-ok`.
+- Monitor samples stay `STATUS=ok`.
+- `GCP_TCP=ok`, proving the tunnel can be rebuilt after company WiFi and external WiFi + VPN route changes.
+- Remote `10800` dangerous stale sockets stay below threshold.
+- Local `TIME_WAIT` stays below the configured headroom limits.
+
 ## If It Still Fails
 
 Run the passive monitor history and read-only diagnosis first:
@@ -139,6 +154,12 @@ The monitor is intended to collect evidence before random disconnects:
 ```
 
 It writes JSONL to `$REAL_HOME/.codex-gcp-tunnel/monitor.jsonl` and a latest summary to `$REAL_HOME/.codex-gcp-tunnel/monitor-latest.env`. It is read-only and must not be used as a repair mechanism.
+
+The monitor splits remote `10800` sockets into active, total stale,
+dangerous stale (`CLOSE-WAIT`/`FIN-WAIT`/`LAST-ACK`/`CLOSING`), and
+`TIME-WAIT`. Treat dangerous stale growth as a real socket leak signal.
+Plain `TIME-WAIT` alone is normal short-lived traffic and must not trigger
+session-disrupting repairs while the data plane is healthy.
 
 The status-bar app reads `monitor-latest.env` and shows GCP traffic next to `修复 GCP` as `今日 ... / 24h ...`. Treat warning or critical traffic as a cost investigation signal before running another repair.
 

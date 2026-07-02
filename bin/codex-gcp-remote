@@ -572,7 +572,7 @@ ensure_gcp_host_route() {
   gateway="$(route_field default gateway)"
   current_gateway="$(route_field "$GCP_HOST" gateway)"
 
-  if [[ "$iface" != utun* && ( -z "$current_gateway" || "$current_gateway" == "$gateway" ) ]]; then
+  if [[ "$iface" != utun* && -n "$current_gateway" && "$current_gateway" == "$gateway" ]]; then
     return 0
   fi
   if [[ -z "$gateway" || "$gateway" == link#* ]]; then
@@ -582,6 +582,8 @@ ensure_gcp_host_route() {
 
   if [[ "$iface" == utun* ]]; then
     printf 'GCP route currently uses VPN interface %s; pinning %s via %s\n' "$iface" "$GCP_HOST" "$gateway"
+  elif [[ -z "$current_gateway" ]]; then
+    printf 'GCP route currently has no gateway on interface %s; pinning %s via current gateway %s\n' "$iface" "$GCP_HOST" "$gateway"
   else
     printf 'GCP route currently uses stale gateway %s; pinning %s via current gateway %s\n' "$current_gateway" "$GCP_HOST" "$gateway"
   fi
@@ -591,13 +593,14 @@ ensure_gcp_host_route() {
     return 0
   fi
 
+  route -n delete -host "$GCP_HOST" >/dev/null 2>&1 || true
   if route -n add -host "$GCP_HOST" "$gateway" >/dev/null 2>&1 ||
      route -n change -host "$GCP_HOST" "$gateway" >/dev/null 2>&1; then
     return 0
   fi
 
   if have osascript; then
-    osascript -e "do shell script \"route -n add -host $GCP_HOST $gateway 2>/dev/null || route -n change -host $GCP_HOST $gateway\" with administrator privileges" >/dev/null 2>&1 || {
+    osascript -e "do shell script \"route -n delete -host $GCP_HOST 2>/dev/null || true; route -n add -host $GCP_HOST $gateway 2>/dev/null || route -n change -host $GCP_HOST $gateway\" with administrator privileges" >/dev/null 2>&1 || {
       printf 'WARNING: could not add GCP host route via administrator prompt\n' >&2
       return 0
     }
@@ -959,7 +962,11 @@ start_local_http() {
 
   cat > "$PRIVOXY_CONF" <<EOF
 listen-address ${LOCAL_HTTP_HOST}:${LOCAL_HTTP_PORT}
-forward-socks5t / ${LOCAL_SOCKS_HOST}:${LOCAL_SOCKS_PORT} .
+forward-socks5 / ${LOCAL_SOCKS_HOST}:${LOCAL_SOCKS_PORT} .
+keep-alive-timeout 1
+connection-sharing 0
+socket-timeout 30
+max-client-connections 512
 toggle 1
 enable-remote-toggle 0
 enable-edit-actions 0

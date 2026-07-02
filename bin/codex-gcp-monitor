@@ -296,7 +296,25 @@ set -u
 listen_count="$(ss -ltn 2>/dev/null | awk -v port="$REMOTE_HTTP_PORT" '$4 ~ ":" port "$" { count++ } END { print count + 0 }')"
 socket_count="$(ss -tnp 2>/dev/null | awk -v port="$REMOTE_HTTP_PORT" '$4 ~ ":" port "$" || $5 ~ ":" port "$" { count++ } END { print count + 0 }')"
 active_socket_count="$(ss -tnp 2>/dev/null | awk -v port="$REMOTE_HTTP_PORT" '($4 ~ ":" port "$" || $5 ~ ":" port "$") && ($1 == "ESTAB" || $1 ~ /^SYN-/) { count++ } END { print count + 0 }')"
-stale_socket_count="$(ss -tnp 2>/dev/null | awk -v port="$REMOTE_HTTP_PORT" '($4 ~ ":" port "$" || $5 ~ ":" port "$") && ($1 == "CLOSE-WAIT" || $1 ~ /^FIN-WAIT/ || $1 == "LAST-ACK" || $1 == "CLOSING" || $1 == "TIME-WAIT") { count++ } END { print count + 0 }')"
+socket_state_counts="$(ss -tnp 2>/dev/null | awk -v port="$REMOTE_HTTP_PORT" '
+  $4 ~ ":" port "$" || $5 ~ ":" port "$" {
+    if ($1 == "CLOSE-WAIT") close_wait++
+    else if ($1 ~ /^FIN-WAIT/) fin_wait++
+    else if ($1 == "LAST-ACK") last_ack++
+    else if ($1 == "CLOSING") closing++
+    else if ($1 == "TIME-WAIT") time_wait++
+  }
+  END {
+    printf "CLOSE_WAIT=%d\nFIN_WAIT=%d\nLAST_ACK=%d\nCLOSING=%d\nTIME_WAIT=%d\n", close_wait+0, fin_wait+0, last_ack+0, closing+0, time_wait+0
+  }
+')"
+close_wait_socket_count="$(awk -F= '$1=="CLOSE_WAIT" {print $2; exit}' <<<"$socket_state_counts")"
+fin_wait_socket_count="$(awk -F= '$1=="FIN_WAIT" {print $2; exit}' <<<"$socket_state_counts")"
+last_ack_socket_count="$(awk -F= '$1=="LAST_ACK" {print $2; exit}' <<<"$socket_state_counts")"
+closing_socket_count="$(awk -F= '$1=="CLOSING" {print $2; exit}' <<<"$socket_state_counts")"
+time_wait_socket_count="$(awk -F= '$1=="TIME_WAIT" {print $2; exit}' <<<"$socket_state_counts")"
+danger_stale_socket_count="$((close_wait_socket_count + fin_wait_socket_count + last_ack_socket_count + closing_socket_count))"
+stale_socket_count="$((danger_stale_socket_count + time_wait_socket_count))"
 proxy_ip="$(curl -sS --connect-timeout "$MONITOR_CONNECT_TIMEOUT" --max-time "$MONITOR_MAX_TIME" -x "$REMOTE_HTTP_URL" "$IP_CHECK_URL" 2>/dev/null || true)"
 chatgpt_code="$(curl -sS -o /dev/null -w '%{http_code}' --connect-timeout "$MONITOR_CONNECT_TIMEOUT" --max-time "$MONITOR_MAX_TIME" -x "$REMOTE_HTTP_URL" "$CHATGPT_CODEX_URL" 2>/dev/null || true)"
 app_server_count="$(ps -eo args= 2>/dev/null | grep -E 'codex app-server proxy|app-server --listen unix://' | grep -v grep | wc -l | tr -d ' ')"
@@ -318,6 +336,10 @@ printf 'REMOTE_LISTEN=%s\n' "$listen_count"
 printf 'REMOTE_10800_SOCKET_COUNT=%s\n' "$socket_count"
 printf 'REMOTE_10800_ACTIVE_SOCKET_COUNT=%s\n' "$active_socket_count"
 printf 'REMOTE_10800_STALE_SOCKET_COUNT=%s\n' "$stale_socket_count"
+printf 'REMOTE_10800_DANGER_STALE_SOCKET_COUNT=%s\n' "$danger_stale_socket_count"
+printf 'REMOTE_10800_CLOSE_WAIT_SOCKET_COUNT=%s\n' "$close_wait_socket_count"
+printf 'REMOTE_10800_FIN_WAIT_SOCKET_COUNT=%s\n' "$fin_wait_socket_count"
+printf 'REMOTE_10800_TIME_WAIT_SOCKET_COUNT=%s\n' "$time_wait_socket_count"
 printf 'REMOTE_PROXY_IP=%s\n' "$proxy_ip"
 printf 'CHATGPT_CODE=%s\n' "$chatgpt_code"
 printf 'REMOTE_APP_SERVER_COUNT=%s\n' "$app_server_count"
@@ -496,7 +518,7 @@ sample() {
   local ts epoch default_iface default_gateway gcp_iface gcp_gateway gcp_bind
   local socks_count http_count socks_pids http_pids local_http_ip gcp_tcp
   local remote_rc remote_output remote_error remote_err_file remote_listen remote_proxy_ip chatgpt_code remote_app_count remote_notty_count
-  local remote_10800_socket_count remote_10800_active_socket_count remote_10800_stale_socket_count remote_codex_exec_count remote_session_detail
+  local remote_10800_socket_count remote_10800_active_socket_count remote_10800_stale_socket_count remote_10800_danger_stale_socket_count remote_10800_close_wait_socket_count remote_10800_fin_wait_socket_count remote_10800_time_wait_socket_count remote_codex_exec_count remote_session_detail
   local status cause status_file_status status_file_message
   local gcp_counter_output gcp_rx_bytes gcp_tx_bytes gcp_counter_ok traffic_today_bytes traffic_24h_bytes traffic_rate_bytes_per_sec traffic_status
   local traffic_today_human traffic_24h_human traffic_rate_human today_start_epoch yesterday_epoch
@@ -555,6 +577,10 @@ sample() {
   remote_10800_socket_count="$(awk -F= '$1=="REMOTE_10800_SOCKET_COUNT" {print $2; exit}' <<<"$remote_output")"
   remote_10800_active_socket_count="$(awk -F= '$1=="REMOTE_10800_ACTIVE_SOCKET_COUNT" {print $2; exit}' <<<"$remote_output")"
   remote_10800_stale_socket_count="$(awk -F= '$1=="REMOTE_10800_STALE_SOCKET_COUNT" {print $2; exit}' <<<"$remote_output")"
+  remote_10800_danger_stale_socket_count="$(awk -F= '$1=="REMOTE_10800_DANGER_STALE_SOCKET_COUNT" {print $2; exit}' <<<"$remote_output")"
+  remote_10800_close_wait_socket_count="$(awk -F= '$1=="REMOTE_10800_CLOSE_WAIT_SOCKET_COUNT" {print $2; exit}' <<<"$remote_output")"
+  remote_10800_fin_wait_socket_count="$(awk -F= '$1=="REMOTE_10800_FIN_WAIT_SOCKET_COUNT" {print $2; exit}' <<<"$remote_output")"
+  remote_10800_time_wait_socket_count="$(awk -F= '$1=="REMOTE_10800_TIME_WAIT_SOCKET_COUNT" {print $2; exit}' <<<"$remote_output")"
   remote_proxy_ip="$(awk -F= '$1=="REMOTE_PROXY_IP" {print $2; exit}' <<<"$remote_output")"
   chatgpt_code="$(awk -F= '$1=="CHATGPT_CODE" {print $2; exit}' <<<"$remote_output")"
   remote_app_count="$(awk -F= '$1=="REMOTE_APP_SERVER_COUNT" {print $2; exit}' <<<"$remote_output")"
@@ -568,6 +594,10 @@ sample() {
   remote_10800_socket_count="${remote_10800_socket_count:-0}"
   remote_10800_active_socket_count="${remote_10800_active_socket_count:-0}"
   remote_10800_stale_socket_count="${remote_10800_stale_socket_count:-0}"
+  remote_10800_danger_stale_socket_count="${remote_10800_danger_stale_socket_count:-0}"
+  remote_10800_close_wait_socket_count="${remote_10800_close_wait_socket_count:-0}"
+  remote_10800_fin_wait_socket_count="${remote_10800_fin_wait_socket_count:-0}"
+  remote_10800_time_wait_socket_count="${remote_10800_time_wait_socket_count:-0}"
   remote_codex_exec_count="${remote_codex_exec_count:-0}"
 
   {
@@ -577,6 +607,10 @@ sample() {
     printf 'REMOTE_10800_SOCKET_COUNT=%s\n' "$remote_10800_socket_count"
     printf 'REMOTE_10800_ACTIVE_SOCKET_COUNT=%s\n' "$remote_10800_active_socket_count"
     printf 'REMOTE_10800_STALE_SOCKET_COUNT=%s\n' "$remote_10800_stale_socket_count"
+    printf 'REMOTE_10800_DANGER_STALE_SOCKET_COUNT=%s\n' "$remote_10800_danger_stale_socket_count"
+    printf 'REMOTE_10800_CLOSE_WAIT_SOCKET_COUNT=%s\n' "$remote_10800_close_wait_socket_count"
+    printf 'REMOTE_10800_FIN_WAIT_SOCKET_COUNT=%s\n' "$remote_10800_fin_wait_socket_count"
+    printf 'REMOTE_10800_TIME_WAIT_SOCKET_COUNT=%s\n' "$remote_10800_time_wait_socket_count"
     printf 'REMOTE_APP_SERVER_COUNT=%s\n' "${remote_app_count:-0}"
     printf 'REMOTE_NOTTY_COUNT=%s\n' "${remote_notty_count:-0}"
     printf '\n'
@@ -593,14 +627,14 @@ sample() {
 
   status="ok"
   cause="ok"
-  if [[ "$gcp_tcp" != "ok" ]]; then
-    status="fail"; cause="gcp_tcp_fail"
-  elif [[ "$socks_count" == "0" ]]; then
+  if [[ "$socks_count" == "0" ]]; then
     status="fail"; cause="local_1080_missing"
   elif [[ "$http_count" == "0" ]]; then
     status="fail"; cause="local_7890_missing"
   elif [[ "$local_http_ip" != "$GCP_EXPECTED_IP" && "$remote_chain_ok" != "1" ]]; then
     status="fail"; cause="local_7890_bad_egress"
+  elif [[ "$gcp_tcp" != "ok" && "$remote_chain_ok" != "1" ]]; then
+    status="fail"; cause="gcp_tcp_fail"
   elif [[ "$remote_rc" -ne 0 ]]; then
     status="fail"; cause="remote_ssh_fail_${remote_rc}"
   elif [[ "${remote_listen:-0}" == "0" ]]; then
@@ -625,6 +659,10 @@ REMOTE_10800_COUNT=${remote_listen:-}
 REMOTE_10800_SOCKET_COUNT=$remote_10800_socket_count
 REMOTE_10800_ACTIVE_SOCKET_COUNT=$remote_10800_active_socket_count
 REMOTE_10800_STALE_SOCKET_COUNT=$remote_10800_stale_socket_count
+REMOTE_10800_DANGER_STALE_SOCKET_COUNT=$remote_10800_danger_stale_socket_count
+REMOTE_10800_CLOSE_WAIT_SOCKET_COUNT=$remote_10800_close_wait_socket_count
+REMOTE_10800_FIN_WAIT_SOCKET_COUNT=$remote_10800_fin_wait_socket_count
+REMOTE_10800_TIME_WAIT_SOCKET_COUNT=$remote_10800_time_wait_socket_count
 REMOTE_10800_IP=$remote_proxy_ip
 CHATGPT_CODE=$chatgpt_code
 REMOTE_CODEX_EXEC_COUNT=$remote_codex_exec_count

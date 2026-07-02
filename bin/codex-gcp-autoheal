@@ -163,7 +163,7 @@ cooldown_remaining() {
 }
 
 should_autoheal() {
-  local status cause fails remaining stale_sockets active_sockets remote_count local_http_ip
+  local status cause fails remaining stale_sockets danger_stale_sockets active_sockets remote_count local_http_ip
 
   [[ "$CODEX_GCP_AUTOHEAL_ENABLED" == "1" ]] || {
     printf 'skip: autoheal disabled\n'
@@ -185,12 +185,13 @@ should_autoheal() {
     return 1
   }
   stale_sockets="$(number_or_zero "$(kv_value REMOTE_10800_STALE_SOCKET_COUNT)")"
+  danger_stale_sockets="$(number_or_zero "$(kv_value REMOTE_10800_DANGER_STALE_SOCKET_COUNT)")"
   active_sockets="$(number_or_zero "$(kv_value REMOTE_10800_ACTIVE_SOCKET_COUNT)")"
   remote_count="$(number_or_zero "$(kv_value REMOTE_10800_COUNT)")"
   local_http_ip="$(kv_value LOCAL_7890_IP)"
-  if [[ "$stale_sockets" -ge "$AUTOHEAL_STALE_SOCKET_THRESHOLD" ]]; then
-    if [[ "$status" != "fail" && "$stale_sockets" -lt "$active_sockets" ]]; then
-      printf 'skip: stale sockets above threshold but active sockets dominate stale=%s active=%s threshold=%s\n' "$stale_sockets" "$active_sockets" "$AUTOHEAL_STALE_SOCKET_THRESHOLD"
+  if [[ "$danger_stale_sockets" -ge "$AUTOHEAL_STALE_SOCKET_THRESHOLD" ]]; then
+    if [[ "$status" != "fail" ]]; then
+      printf 'skip: dangerous stale sockets above threshold but data plane is still ok danger_stale=%s stale=%s active=%s threshold=%s\n' "$danger_stale_sockets" "$stale_sockets" "$active_sockets" "$AUTOHEAL_STALE_SOCKET_THRESHOLD"
       return 1
     fi
     remaining="$(number_or_zero "$(cooldown_remaining "$AUTOHEAL_SOCKET_STORM_LAST_FILE" "$AUTOHEAL_SOCKET_STORM_COOLDOWN_SECONDS")")"
@@ -198,8 +199,12 @@ should_autoheal() {
       printf 'skip: socket-storm cooldown %ss remaining\n' "$remaining"
       return 1
     fi
-    printf 'heal: cause=remote_10800_socket_storm stale_sockets=%s active_sockets=%s threshold=%s status=%s\n' "$stale_sockets" "$active_sockets" "$AUTOHEAL_STALE_SOCKET_THRESHOLD" "$status"
+    printf 'heal: cause=remote_10800_socket_storm danger_stale_sockets=%s stale_sockets=%s active_sockets=%s threshold=%s status=%s\n' "$danger_stale_sockets" "$stale_sockets" "$active_sockets" "$AUTOHEAL_STALE_SOCKET_THRESHOLD" "$status"
     return 0
+  fi
+  if [[ "$stale_sockets" -ge "$AUTOHEAL_STALE_SOCKET_THRESHOLD" ]]; then
+    printf 'skip: stale sockets above threshold are not dangerous enough stale=%s danger_stale=%s active=%s threshold=%s\n' "$stale_sockets" "$danger_stale_sockets" "$active_sockets" "$AUTOHEAL_STALE_SOCKET_THRESHOLD"
+    return 1
   fi
   if [[ "$remote_count" -gt 0 && "$local_http_ip" == "${GCP_EXPECTED_IP:-}" ]]; then
     case "$cause" in

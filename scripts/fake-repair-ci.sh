@@ -24,7 +24,7 @@ reject_pattern() {
 }
 
 printf '== static syntax ==\n'
-bash -n bin/kinit-refresh bin/codex-gcp-remote bin/codex-gcp-socks-session bin/codex-gcp-forward-session bin/codex-gcp-monitor bin/codex-gcp-autoheal bin/codex-workspace-proxy bin/cursor-remote-reset bin/stay-awake.sh scripts/install.sh scripts/fake-repair-ci.sh scripts/live-egress-ci.sh
+bash -n bin/kinit-refresh bin/codex-gcp-remote bin/codex-gcp-socks-session bin/codex-gcp-forward-session bin/codex-gcp-monitor bin/codex-gcp-autoheal bin/codex-gcp-stability-check bin/codex-workspace-proxy bin/cursor-remote-reset bin/stay-awake.sh scripts/install.sh scripts/fake-repair-ci.sh scripts/live-egress-ci.sh
 bin/codex-gcp-monitor self-test
 bin/codex-gcp-autoheal self-test
 swiftc -parse app/kinit-refresh-status.swift
@@ -187,7 +187,9 @@ need_pattern 'AUTOHEAL_COOLDOWN_SECONDS' bin/codex-gcp-autoheal
 need_pattern 'AUTOHEAL_SOCKET_STORM_COOLDOWN_SECONDS' bin/codex-gcp-autoheal
 need_pattern 'AUTOHEAL_STALE_SOCKET_THRESHOLD' bin/codex-gcp-autoheal
 need_pattern 'AUTOHEAL_ALLOW_APP_SERVER_RESTART' bin/codex-gcp-autoheal
-need_pattern 'active sockets dominate' bin/codex-gcp-autoheal
+need_pattern 'REMOTE_10800_DANGER_STALE_SOCKET_COUNT' bin/codex-gcp-autoheal
+need_pattern 'data plane is still ok' bin/codex-gcp-autoheal
+need_pattern 'not dangerous enough' bin/codex-gcp-autoheal
 need_pattern 'remote_10800_data_plane_repair_remote_sockets' bin/codex-gcp-autoheal
 need_pattern 'reset-socket-storm' bin/codex-gcp-autoheal
 need_pattern 'REPAIR_LOCK_DIR' bin/codex-gcp-autoheal
@@ -201,6 +203,7 @@ need_pattern 'consecutive_fail_count' bin/codex-gcp-autoheal
 need_pattern 'post-repair monitor still fail' bin/codex-gcp-autoheal
 need_pattern 'kinit-refresh' bin/codex-gcp-autoheal
 need_pattern 'codex-gcp-autoheal' scripts/install.sh
+need_pattern 'codex-gcp-stability-check' scripts/install.sh
 need_pattern 'com.example.codex-gcp-autoheal.plist' scripts/install.sh
 need_pattern 'StartInterval' launchd/com.example.codex-gcp-autoheal.plist
 need_pattern 'CODEX_GCP_AUTOHEAL_ENABLED' config.env.example
