@@ -867,13 +867,7 @@ start_local_socks() {
   existing_code="$(retry_code_probe curl_code_local_socks 2 1 || true)"
   if [[ -n "$(listener_pids "$LOCAL_SOCKS_PORT")" && "$existing_ip" == "$GCP_EXPECTED_IP" ]] && http_code_ok "$existing_code"; then
     if [[ -f "$LOCAL_SOCKS_PLIST" ]] && ! launchd_loaded "$LOCAL_SOCKS_LABEL"; then
-      printf 'local SOCKS is healthy but not launchd-managed; switching to persistent LaunchAgent\n'
-      kill_listeners "$LOCAL_SOCKS_PORT"
-      if start_local_socks_launchd; then
-        return
-      fi
-      printf 'WARNING: local SOCKS LaunchAgent did not become healthy; falling back to manual ssh\n' >&2
-      stop_local_socks_launchd
+      printf 'local SOCKS is healthy but not launchd-managed; reusing listener for incident recovery\n'
     fi
     printf 'local SOCKS already healthy; reusing existing listener\n'
     listener_pids "$LOCAL_SOCKS_PORT" | head -n 1 > "$STATE_DIR/gcp-socks.manual.pid"
