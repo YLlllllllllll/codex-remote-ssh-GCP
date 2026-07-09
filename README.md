@@ -13,6 +13,15 @@ remote Codex -> remote 127.0.0.1:10800 HTTP
              -> GCP egress
 ```
 
+The remote wrapper keeps the official OpenAI provider, model catalog, and
+ChatGPT login. It disables ChatGPT Apps initialization and skips the online
+remote plugin catalog refresh; installed local plugins and skills remain
+available. Privoxy uses a 30-minute socket timeout so valid long-reasoning
+silence on Responses WebSockets is not mistaken for a dead tunnel.
+Fresh remote SSH monitor probes use a separate 10-second timeout and retry up
+to three times so a single workspace-gateway banner delay is not reported as a
+broken Codex path.
+
 The menu-bar app reads `/tmp/kinit-refresh.status` and exposes:
 
 - `一键恢复波动`: the normal incident button for Codex reconnecting, ChatGPT

@@ -17,15 +17,16 @@ metadata:
 
 ## One-Shot Repair
 
-Use this only when the user wants the live GCP tunnel repaired. It is intentionally the simplest supported path and maps to forced cleanup, rebuild, and verification:
+Use this when the user reports reconnecting or wants the live GCP tunnel repaired. It captures a health snapshot, keeps healthy layers, performs the smallest required repair, and verifies the result:
 
 ```bash
 REAL_HOME="$(dscl . -read "/Users/$(id -un)" NFSHomeDirectory 2>/dev/null | awk '{print $2; exit}')"
 REAL_HOME="${REAL_HOME:-/Users/$(id -un)}"
-"$REAL_HOME/bin/kinit-refresh" remote-gcp
+"$REAL_HOME/bin/kinit-refresh" recover-flap
 ```
 
-The status-bar app's `修复 GCP` menu item should run the same command. Do not choose alternate repair variants unless the user explicitly asks for debugging.
+The status-bar app's `一键恢复波动` menu item runs the same command. Use
+`remote-gcp` only when an explicit full rebuild is required.
 
 Manual repair also cleans stale remote state. It may reset local `1080/7890`, remote `10800`, stale SSH tunnel sessions, remote app-server/proxy state, and `codex exec` workers older than `STALE_CODEX_EXEC_MIN_AGE`. It must not blindly kill every remote Codex process, because fresh user work may still be legitimate.
 
@@ -160,6 +161,18 @@ dangerous stale (`CLOSE-WAIT`/`FIN-WAIT`/`LAST-ACK`/`CLOSING`), and
 `TIME-WAIT`. Treat dangerous stale growth as a real socket leak signal.
 Plain `TIME-WAIT` alone is normal short-lived traffic and must not trigger
 session-disrupting repairs while the data plane is healthy.
+
+Fresh workspace SSH connections have a different latency distribution from
+HTTP probes. The monitor uses a separate 10-second SSH timeout with up to three
+bounded attempts so one delayed banner is not reported as a broken data plane;
+three failed attempts still produce `remote_ssh_fail_255`.
+
+For Codex CLI 0.144 and later, keep Privoxy `socket-timeout 1800`. The old
+30-second timeout can terminate a valid silent reasoning interval and surface
+as repeated `Reconnecting` on `gpt-5.6-sol`. Keep the built-in `openai`
+provider and official model catalog; do not add a custom transport provider.
+The remote wrapper may disable Apps initialization and online remote-plugin
+catalog refresh, while installed plugins and skills remain available.
 
 The status-bar app reads `monitor-latest.env` and shows GCP traffic next to `修复 GCP` as `今日 ... / 24h ...`. Treat warning or critical traffic as a cost investigation signal before running another repair.
 

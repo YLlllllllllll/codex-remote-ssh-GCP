@@ -103,6 +103,16 @@ need_pattern 'verify_local_socks_only' bin/codex-gcp-remote
 need_pattern 'curl_code_local_socks' bin/codex-gcp-remote
 need_pattern 'curl_code_local_http' bin/codex-gcp-remote
 need_pattern 'local http chatgpt code' bin/codex-gcp-remote
+need_pattern 'MONITOR_SSH_CONNECT_TIMEOUT' bin/codex-gcp-monitor
+need_pattern 'MONITOR_SSH_ATTEMPTS' bin/codex-gcp-monitor
+[[ "$(rg -c 'ConnectTimeout="\$MONITOR_SSH_CONNECT_TIMEOUT"' bin/codex-gcp-monitor)" -ge 2 ]] || fail "SSH probes must use MONITOR_SSH_CONNECT_TIMEOUT"
+need_pattern 'remote_attempt=\$\(\(remote_attempt \+ 1\)\)' bin/codex-gcp-monitor
+need_pattern 'privoxy_config_is_current' bin/codex-gcp-remote
+need_pattern 'CODEX_PRIVOXY_SOCKET_TIMEOUT' bin/codex-gcp-remote
+need_pattern 'Remote startup guard' bin/codex-gcp-remote
+need_pattern 'features.apps=false' bin/codex-gcp-remote
+need_pattern 'features.remote_plugin=false' bin/codex-gcp-remote
+reject_pattern 'model_providers\.openai_sse' bin/codex-gcp-remote
 need_pattern 'deep_repair_validate_with_recovery' bin/codex-gcp-remote
 need_pattern 'ensure_local_tcp_headroom' bin/codex-gcp-remote
 need_pattern 'CODEX_TCP_MSL' bin/codex-gcp-remote
@@ -113,6 +123,7 @@ need_pattern 'command_requires_repair_lock' bin/codex-gcp-remote
 need_pattern 'local_tcp_state_summary' bin/codex-gcp-remote
 need_pattern 'remote_socket_summary' bin/codex-gcp-remote
 need_pattern 'openai-ok' bin/codex-gcp-remote
+need_pattern '< /dev/null 2>&1' bin/codex-gcp-remote
 need_pattern 'stop-egress' bin/codex-gcp-remote
 need_pattern 'limit-egress' bin/codex-gcp-remote
 need_pattern 'clean-workers' bin/codex-gcp-remote

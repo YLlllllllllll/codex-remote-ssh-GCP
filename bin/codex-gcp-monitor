@@ -35,7 +35,14 @@ IP_CHECK_URL="${MONITOR_IP_CHECK_URL:-http://api.ipify.org}"
 CHATGPT_CODEX_URL="${CHATGPT_CODEX_URL:-https://chatgpt.com/backend-api/codex/responses}"
 MONITOR_CONNECT_TIMEOUT="${MONITOR_CONNECT_TIMEOUT:-3}"
 MONITOR_MAX_TIME="${MONITOR_MAX_TIME:-8}"
+MONITOR_SSH_CONNECT_TIMEOUT="${MONITOR_SSH_CONNECT_TIMEOUT:-10}"
+MONITOR_SSH_ATTEMPTS="${MONITOR_SSH_ATTEMPTS:-3}"
+MONITOR_SSH_RETRY_DELAY="${MONITOR_SSH_RETRY_DELAY:-1}"
 MONITOR_MAX_BYTES="${MONITOR_MAX_BYTES:-10485760}"
+
+case "$MONITOR_SSH_ATTEMPTS" in
+  ''|*[!0-9]*|0) MONITOR_SSH_ATTEMPTS=3 ;;
+esac
 
 STATE_DIR="${STATE_DIR:-$LOCAL_HOME/.codex-gcp-tunnel}"
 LOG_FILE="${MONITOR_LOG_FILE:-$STATE_DIR/monitor.jsonl}"
@@ -170,7 +177,7 @@ gcp_counter_probe() {
     "${extra_opts[@]}" \
     -p "$GCP_PORT" \
     -o BatchMode=yes \
-    -o ConnectTimeout="$MONITOR_CONNECT_TIMEOUT" \
+    -o ConnectTimeout="$MONITOR_SSH_CONNECT_TIMEOUT" \
     -o ConnectionAttempts=1 \
     "${GCP_USER}@${GCP_HOST}" \
     "awk -v iface='${GCP_TRAFFIC_IFACE}:' '\$1 == iface { print \$2, \$10; found=1 } END { exit found ? 0 : 1 }' /proc/net/dev" \
@@ -337,7 +344,7 @@ json_optional_number() {
 remote_probe() {
   ssh \
     -o BatchMode=yes \
-    -o ConnectTimeout="$MONITOR_CONNECT_TIMEOUT" \
+    -o ConnectTimeout="$MONITOR_SSH_CONNECT_TIMEOUT" \
     -o ConnectionAttempts=1 \
     -o ServerAliveInterval=5 \
     -o ServerAliveCountMax=1 \
@@ -538,7 +545,7 @@ capture_incident_if_needed() {
     printf '\n'
   } | section_to_file "$evidence" "gcp tcp probe"
   {
-    ssh -o BatchMode=yes -o ConnectTimeout="$MONITOR_CONNECT_TIMEOUT" -o ConnectionAttempts=1 "$REMOTE_HOST" \
+    ssh -o BatchMode=yes -o ConnectTimeout="$MONITOR_SSH_CONNECT_TIMEOUT" -o ConnectionAttempts=1 "$REMOTE_HOST" \
       "printf 'remote 10800 states: '; ss -tan '( sport = :${REMOTE_HTTP_PORT} or dport = :${REMOTE_HTTP_PORT} )' 2>/dev/null | tail -n +2 | awk '{c[\$1]++} END{total=0; for (s in c) total+=c[s]; printf \"TOTAL=%d\", total; for (s in c) printf \" %s=%d\", s, c[s]; printf \"\\n\"}'; printf '\\nremote app-server processes:\\n'; ps -eo pid=,ppid=,etimes=,args= 2>/dev/null | grep -E 'codex app-server proxy|app-server --listen unix://' | grep -v grep || true" 2>&1 || true
   } | section_to_file "$evidence" "remote 10800 and app-server"
   { tail -120 "$LOG_FILE" 2>/dev/null || true; } > "$incident_path/monitor-tail.jsonl"
@@ -624,9 +631,29 @@ sample() {
   status_file_status="$(awk -F= '$1=="STATUS" {print $2; exit}' /tmp/kinit-refresh.status 2>/dev/null || true)"
   status_file_message="$(awk -F= '$1=="MESSAGE" {print $2; exit}' /tmp/kinit-refresh.status 2>/dev/null || true)"
 
-  remote_rc=0
+  remote_rc=255
+  remote_attempt=1
   remote_err_file="$STATE_DIR/remote-probe.$$.err"
-  remote_output="$(remote_probe 2>"$remote_err_file")" || remote_rc=$?
+  : > "$remote_err_file"
+  while [[ "$remote_attempt" -le "$MONITOR_SSH_ATTEMPTS" ]]; do
+    remote_attempt_err_file="${remote_err_file}.${remote_attempt}"
+    if remote_output="$(remote_probe 2>"$remote_attempt_err_file")"; then
+      remote_rc=0
+      cat "$remote_attempt_err_file" >> "$remote_err_file" 2>/dev/null || true
+      rm -f "$remote_attempt_err_file" 2>/dev/null || true
+      break
+    else
+      remote_rc=$?
+      printf 'attempt %s/%s: ' "$remote_attempt" "$MONITOR_SSH_ATTEMPTS" >> "$remote_err_file"
+      tr '\n' ' ' < "$remote_attempt_err_file" >> "$remote_err_file" 2>/dev/null || true
+      printf '\n' >> "$remote_err_file"
+      rm -f "$remote_attempt_err_file" 2>/dev/null || true
+    fi
+    if [[ "$remote_attempt" -lt "$MONITOR_SSH_ATTEMPTS" ]]; then
+      sleep "$MONITOR_SSH_RETRY_DELAY"
+    fi
+    remote_attempt=$((remote_attempt + 1))
+  done
   remote_error="$(tr '\n' ' ' < "$remote_err_file" 2>/dev/null | cut -c 1-500 || true)"
   rm -f "$remote_err_file" 2>/dev/null || true
   remote_listen="$(awk -F= '$1=="REMOTE_LISTEN" {print $2; exit}' <<<"$remote_output")"

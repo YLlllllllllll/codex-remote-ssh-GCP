@@ -36,7 +36,7 @@ set -Eeuo pipefail
 # - Do not write global shell HTTP_PROXY/HTTPS_PROXY.
 # - Do not use 18080 or 18081.
 # - Do not route git/npm/pip/browser/general shell traffic through GCP.
-# - Do not use ModelHub/Azure/custom provider for the main path.
+# - Do not use ModelHub/Azure/custom providers for the main path.
 #
 # Why this script exists
 # ----------------------
@@ -73,6 +73,7 @@ LOCAL_SOCKS_HOST="${LOCAL_SOCKS_HOST:-127.0.0.1}"
 LOCAL_SOCKS_PORT="${LOCAL_SOCKS_PORT:-1080}"
 LOCAL_HTTP_HOST="${LOCAL_HTTP_HOST:-127.0.0.1}"
 LOCAL_HTTP_PORT="${LOCAL_HTTP_PORT:-7890}"
+PRIVOXY_SOCKET_TIMEOUT="${CODEX_PRIVOXY_SOCKET_TIMEOUT:-1800}"
 REMOTE_HTTP_HOST="${REMOTE_HTTP_HOST:-127.0.0.1}"
 REMOTE_HTTP_PORT="${REMOTE_HTTP_PORT:-10800}"
 IP_CHECK_TIMEOUT="${IP_CHECK_TIMEOUT:-15}"
@@ -932,6 +933,12 @@ start_local_socks() {
   fi
 }
 
+privoxy_config_is_current() {
+  [[ -f "$PRIVOXY_CONF" ]] || return 1
+  grep -Fqx "forward-socks5 / ${LOCAL_SOCKS_HOST}:${LOCAL_SOCKS_PORT} ." "$PRIVOXY_CONF" &&
+    grep -Fqx "socket-timeout ${PRIVOXY_SOCKET_TIMEOUT}" "$PRIVOXY_CONF"
+}
+
 start_local_http() {
   section "Ensure local HTTP ${LOCAL_HTTP_HOST}:${LOCAL_HTTP_PORT}"
   mkdir -p "$STATE_DIR"
@@ -940,12 +947,15 @@ start_local_http() {
   existing_ip="$(retry_ip_probe curl_ip_local_http 2 1 || true)"
   existing_code="$(retry_code_probe curl_code_local_http 2 1 || true)"
   if [[ -n "$(listener_pids "$LOCAL_HTTP_PORT")" && "$existing_ip" == "$GCP_EXPECTED_IP" ]] && http_code_ok "$existing_code"; then
-    printf 'local HTTP proxy already healthy; reusing existing listener\n'
-    listener_pids "$LOCAL_HTTP_PORT" | head -n 1 > "$STATE_DIR/privoxy.manual.pid"
-    lsof -nP -iTCP:"$LOCAL_HTTP_PORT" -sTCP:LISTEN
-    printf 'local http ip: %s\n' "$existing_ip"
-    printf 'local http chatgpt code: %s\n' "$existing_code"
-    return
+    if privoxy_config_is_current; then
+      printf 'local HTTP proxy already healthy; reusing existing listener\n'
+      listener_pids "$LOCAL_HTTP_PORT" | head -n 1 > "$STATE_DIR/privoxy.manual.pid"
+      lsof -nP -iTCP:"$LOCAL_HTTP_PORT" -sTCP:LISTEN
+      printf 'local http ip: %s\n' "$existing_ip"
+      printf 'local http chatgpt code: %s\n' "$existing_code"
+      return
+    fi
+    printf 'local HTTP proxy is healthy but config drifted; restarting listener\n'
   fi
 
   local bin
@@ -959,7 +969,7 @@ listen-address ${LOCAL_HTTP_HOST}:${LOCAL_HTTP_PORT}
 forward-socks5 / ${LOCAL_SOCKS_HOST}:${LOCAL_SOCKS_PORT} .
 keep-alive-timeout 1
 connection-sharing 0
-socket-timeout 30
+socket-timeout ${PRIVOXY_SOCKET_TIMEOUT}
 max-client-connections 512
 toggle 1
 enable-remote-toggle 0
@@ -1033,6 +1043,10 @@ grep -q '127\.0\.0\.1:10800' "$HOME/.codex/proxy.env"
 grep -q '\.bytedance\.net' "$HOME/.codex/proxy.env"
 grep -q '\.bytedance\.net' "$HOME/.local/bin/codex-gcp"
 grep -q '\.bytedance\.net' "$HOME/.local/node/bin/codex"
+grep -Fq 'Remote startup guard' "$HOME/.local/node/bin/codex"
+grep -Fq 'features.apps=false' "$HOME/.local/node/bin/codex"
+grep -Fq 'features.remote_plugin=false' "$HOME/.local/node/bin/codex"
+! grep -Eq 'model_provider|model_providers|supports_websockets' "$HOME/.local/node/bin/codex"
 ! grep -Eq '127\.0\.0\.1:18080|127\.0\.0\.1:18081|modelhub|azure|OPENAI_BASE_URL|custom-provider\.example' "$HOME/.codex/proxy.env"
 if [[ -f "$HOME/.codex/config.toml" ]]; then
   ! grep -Eq 'model_provider|model_providers|OPENAI_BASE_URL|custom-provider\.example|azure|modelhub|127\.0\.0\.1:18080|127\.0\.0\.1:18081' "$HOME/.codex/config.toml"
@@ -1151,7 +1165,14 @@ export NO_PROXY="localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
 export no_proxy="$NO_PROXY"
 unset OPENAI_API_KEY OPENAI_BASE_URL OPENAI_ORG_ID OPENAI_ORGANIZATION OPENAI_PROJECT OPENAI_PROJECT_ID
 
-exec "$NODE_BIN" "$CODEX_JS" "$@"
+# Remote startup guard: keep the official provider and model selection while
+# avoiding unrelated network initialization on the constrained remote path.
+REMOTE_CODEX_CONFIG_OVERRIDES=(
+  -c 'features.apps=false'
+  -c 'features.remote_plugin=false'
+)
+
+exec "$NODE_BIN" "$CODEX_JS" "${REMOTE_CODEX_CONFIG_OVERRIDES[@]}" "$@"
 EOF
 chmod +x "$NODE_CODEX_BIN"
 
@@ -1986,9 +2007,9 @@ printf '\n== codex exec openai-ok ==\n'
 cd '$REMOTE_HOME'
 codex_rc=0
 if command -v timeout >/dev/null 2>&1; then
-  codex_out=\"\$(timeout 90s codex exec --skip-git-repo-check --ephemeral --dangerously-bypass-approvals-and-sandbox 'Reply with exactly: openai-ok' 2>&1)\" || codex_rc=\$?
+  codex_out=\"\$(timeout 90s codex exec --skip-git-repo-check --ephemeral --dangerously-bypass-approvals-and-sandbox 'Reply with exactly: openai-ok' < /dev/null 2>&1)\" || codex_rc=\$?
 else
-  codex_out=\"\$(codex exec --skip-git-repo-check --ephemeral --dangerously-bypass-approvals-and-sandbox 'Reply with exactly: openai-ok' 2>&1)\" || codex_rc=\$?
+  codex_out=\"\$(codex exec --skip-git-repo-check --ephemeral --dangerously-bypass-approvals-and-sandbox 'Reply with exactly: openai-ok' < /dev/null 2>&1)\" || codex_rc=\$?
 fi
 printf '%s\n' \"\$codex_out\"
 [ \"\$codex_rc\" -eq 0 ]
