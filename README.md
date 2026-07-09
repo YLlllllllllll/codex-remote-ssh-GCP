@@ -15,13 +15,24 @@ remote Codex -> remote 127.0.0.1:10800 HTTP
 
 The menu-bar app reads `/tmp/kinit-refresh.status` and exposes:
 
+- `一键恢复波动`: the normal incident button for Codex reconnecting, ChatGPT
+  `000`, local `1080` data-plane hangs, local `7890` failures, and remote
+  `10800` socket storms. It runs `debug-fast`, uses the monitor to choose the
+  smallest repair, then finishes with `verify-fast` and a final monitor sample.
 - `智能修复`: samples current state, verifies the local official Codex app/config, then chooses the smallest targeted repair for Cursor SSH, local `1080`, local `7890`, remote `10800`, or version/wrapper drift.
 - `登录/更新 kinit`: prompts once for the Kerberos password, saves it to macOS Keychain, then verifies SSH.
 - `保持唤醒` / `关闭防休眠`: toggles the LaunchAgent-backed stay-awake helper.
 - `Codex Sessions`: expands to remote `codex exec`, `10800`, and app-server session details.
 - `高级`: contains read-only GCP validation, diagnosis, incident logs, auto-heal controls, SSH refresh, and manual Cursor SSH reset.
 
-`智能修复` is the normal button. It first checks whether local Cursor Remote SSH has a stuck install/tunnel process group and resets only that group when needed. It then runs `codex-gcp-monitor sample`, reads `monitor-latest.env`, and maps the failure cause to a narrow command: `repair-local-socks` for local `1080`, `repair-local-http` for local `7890`, `repair-remote-forward` for remote `10800`/ChatGPT data-plane failures, and `repair-remote-sockets` for excessive stale remote `10800` sockets. It only escalates to `deep-repair` when the narrow repair and `repair-fast` do not recover the path, or when local/remote Codex version, default model, or wrapper checks detect drift.
+`一键恢复波动` is the button to use during an active reconnecting incident. It
+first runs `codex-gcp-remote debug-fast`, which snapshots the live path and only
+repairs what is already broken. It then samples `codex-gcp-monitor`, runs
+`智能修复` if the path is still unhealthy, clears dangerous remote `10800` stale
+sockets only after the local data plane is healthy, and finishes with
+`codex-gcp-remote verify-fast`.
+
+`智能修复` is the targeted repair engine behind that button. It first checks whether local Cursor Remote SSH has a stuck install/tunnel process group and resets only that group when needed. It then runs `codex-gcp-monitor sample`, reads `monitor-latest.env`, and maps the failure cause to a narrow command: `repair-local-socks` for local `1080` missing or `local_1080_bad_egress`, `repair-local-http` for local `7890`, `repair-remote-forward` for remote `10800`/ChatGPT data-plane failures, and `repair-remote-sockets` for excessive dangerous stale remote `10800` sockets. It only escalates to `deep-repair` when the narrow repair and `repair-fast` do not recover the path, or when local/remote Codex version, default model, or wrapper checks detect drift.
 
 The local official Codex check verifies `/Applications/Codex.app` is signed by OpenAI, the `codex` CLI points at `/Applications/Codex.app/Contents/Resources/codex`, and `~/.codex/config.toml` does not contain provider overrides such as `model_provider`, `model_providers`, `base_url`, `OPENAI_BASE_URL`, ModelHub/Azure endpoints, `CODEX_HOME=~/.codex-modelhub`, or legacy `18080/18081` proxy state. A notification hook path under `.codex-modelhub` is not treated as provider pollution. If a shell launches with `CODEX_HOME=~/.codex-modelhub`, the check logs that as a warning because Codex CLI from that shell will read the modelhub home instead of the official `~/.codex` home.
 
@@ -64,6 +75,7 @@ kinit-refresh status
 kinit-refresh --dry-run smart-repair
 kinit-refresh ssh-only
 kinit-refresh smart-repair
+kinit-refresh recover-flap
 kinit-refresh remote-gcp
 kinit-refresh stop-gcp
 kinit-refresh log
@@ -91,11 +103,11 @@ codex-gcp-remote verify-fast
 
 It records:
 
-- local listeners on `1080` and `7890`
+- local listeners and egress IPs on `1080` and `7890`
 - route/interface used for the GCP VM
 - GCP VM interface RX/TX counters, today total, 24h total, and recent rate
 - remote `codex exec` worker count and latest session detail log
-- local `7890` egress IP
+- local `1080` and `7890` egress IPs
 - remote `10800` listener and egress IP
 - ChatGPT endpoint HTTP code through remote `10800`
 - remote `10800` socket state split into active, total stale, dangerous stale
@@ -151,6 +163,9 @@ Defaults:
 CODEX_GCP_AUTOHEAL_ENABLED=1
 AUTOHEAL_MIN_CONSECUTIVE_FAILS=2
 AUTOHEAL_COOLDOWN_SECONDS=900
+AUTOHEAL_TARGETED_COOLDOWN_SECONDS=90
+AUTOHEAL_BAD_EGRESS_CONSECUTIVE_FAILS=2
+AUTOHEAL_CHATGPT_CONSECUTIVE_FAILS=2
 AUTOHEAL_MAX_SAMPLE_AGE_SECONDS=300
 AUTOHEAL_REPAIR_MODE=remote-gcp
 AUTOHEAL_STALE_SOCKET_THRESHOLD=20

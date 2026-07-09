@@ -618,13 +618,17 @@ smart_reset_cursor_if_needed() {
 }
 
 smart_monitor_status_message() {
-    printf 'status=%s cause=%s local1080=%s local7890=%s remote10800=%s stale10800=%s chatgpt=%s' \
+    printf 'status=%s cause=%s local1080=%s/%s local7890=%s/%s remote10800=%s/%s stale10800=%s danger10800=%s chatgpt=%s' \
         "$(monitor_value STATUS)" \
         "$(monitor_value CAUSE)" \
         "$(monitor_value LOCAL_1080_COUNT)" \
+        "$(monitor_value LOCAL_1080_IP)" \
         "$(monitor_value LOCAL_7890_COUNT)" \
+        "$(monitor_value LOCAL_7890_IP)" \
         "$(monitor_value REMOTE_10800_COUNT)" \
+        "$(monitor_value REMOTE_10800_IP)" \
         "$(monitor_value REMOTE_10800_STALE_SOCKET_COUNT)" \
+        "$(monitor_value REMOTE_10800_DANGER_STALE_SOCKET_COUNT)" \
         "$(monitor_value CHATGPT_CODE)"
 }
 
@@ -638,15 +642,17 @@ smart_sample_and_log() {
 }
 
 smart_select_repair_command() {
-    local status cause stale_count
+    local status cause stale_count danger_stale_count
     status="$(monitor_value STATUS)"
     cause="$(monitor_value CAUSE)"
     stale_count="$(monitor_value REMOTE_10800_STALE_SOCKET_COUNT)"
+    danger_stale_count="$(monitor_value REMOTE_10800_DANGER_STALE_SOCKET_COUNT)"
     is_uint "$stale_count" || stale_count=0
+    is_uint "$danger_stale_count" || danger_stale_count=0
 
-    if [ "$status" = "ok" ] && [ "$stale_count" -ge "$SMART_REPAIR_STALE_SOCKET_THRESHOLD" ]; then
+    if [ "$status" = "ok" ] && [ "$danger_stale_count" -ge "$SMART_REPAIR_STALE_SOCKET_THRESHOLD" ]; then
         SMART_REPAIR_COMMAND="repair-remote-sockets"
-        SMART_REPAIR_REASON="10800 stale socket 数过高 (${stale_count}), 只重建远端 forward/socket 层"
+        SMART_REPAIR_REASON="10800 dangerous stale socket 数过高 (${danger_stale_count}), 只重建远端 forward/socket 层"
         return 0
     fi
 
@@ -655,7 +661,7 @@ smart_select_repair_command() {
             SMART_REPAIR_COMMAND="none"
             SMART_REPAIR_REASON="monitor 已经为 ok, 不重建 GCP 链路"
             ;;
-        gcp_tcp_fail|local_1080_missing)
+        gcp_tcp_fail|local_1080_missing|local_1080_bad_egress)
             SMART_REPAIR_COMMAND="repair-local-socks"
             SMART_REPAIR_REASON="本地 1080 SOCKS/GCP TCP 异常, 只修复本地 SOCKS 层"
             ;;
@@ -845,6 +851,74 @@ smart_repair() {
     return 1
 }
 
+recover_flap() {
+    local exp rc status cause danger_stale_count
+
+    exp=$(klist 2>/dev/null | awk '/krbtgt/ {print $5, $6, $7, $8; exit}')
+    log "Recover-Flap 启动 (codex_timeout=${CODEX_TIMEOUT_SECONDS}s, ssh_probe=${SSH_PROBE_TARGET})"
+    write_status "running" "ok" "checking" "checking" "$exp" "一键恢复波动: 正在执行最小恢复快照"
+
+    if [ ! -x "$CODEX_REFRESH_SCRIPT" ]; then
+        log "Recover-Flap 失败, Codex 修复脚本不存在或不可执行: $CODEX_REFRESH_SCRIPT"
+        write_status "fail" "ok" "fail" "fail" "$exp" "一键恢复波动失败: 修复脚本不存在"
+        return 127
+    fi
+
+    log "Recover-Flap: 先执行 debug-fast, 只在链路破损时做最小修复"
+    run_with_timeout "$CODEX_TIMEOUT_SECONDS" "$CODEX_REFRESH_SCRIPT" debug-fast
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        log "Recover-Flap: debug-fast 退出码 ${rc}, 继续进入 smart-repair 精准恢复"
+    fi
+
+    smart_sample_and_log || true
+    status="$(monitor_value STATUS)"
+    cause="$(monitor_value CAUSE)"
+    danger_stale_count="$(monitor_value REMOTE_10800_DANGER_STALE_SOCKET_COUNT)"
+    is_uint "$danger_stale_count" || danger_stale_count=0
+
+    if [ "$status" != "ok" ]; then
+        log "Recover-Flap: monitor 仍异常 (${cause:-unknown}), 进入 smart-repair"
+        smart_repair
+        rc=$?
+        [ "$rc" -eq 0 ] || return "$rc"
+    elif [ "$danger_stale_count" -ge "$SMART_REPAIR_STALE_SOCKET_THRESHOLD" ]; then
+        run_codex_repair_command repair-remote-sockets "GCP 可用但远端 10800 dangerous stale socket 过高 (${danger_stale_count})"
+        rc=$?
+        [ "$rc" -eq 0 ] || return "$rc"
+    else
+        log "Recover-Flap: monitor 已恢复, 无需额外修复"
+    fi
+
+    write_status "running" "ok" "checking" "checking" "$exp" "一键恢复波动: 正在最终验证 GCP 出口"
+    run_with_timeout "$CODEX_TIMEOUT_SECONDS" "$CODEX_REFRESH_SCRIPT" verify-fast
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        log "Recover-Flap: verify-fast 失败 (${rc}), 再执行一轮 smart-repair 后复验"
+        smart_repair
+        rc=$?
+        [ "$rc" -eq 0 ] || return "$rc"
+        run_with_timeout "$CODEX_TIMEOUT_SECONDS" "$CODEX_REFRESH_SCRIPT" verify-fast
+        rc=$?
+        [ "$rc" -eq 0 ] || return "$rc"
+    fi
+
+    smart_sample_and_log || true
+    status="$(monitor_value STATUS)"
+    cause="$(monitor_value CAUSE)"
+    exp=$(klist 2>/dev/null | awk '/krbtgt/ {print $5, $6, $7, $8; exit}')
+    if [ "$status" = "ok" ]; then
+        mark_gcp_enabled
+        write_status "ok" "ok" "ok" "ok" "$exp" "一键恢复波动完成: GCP 链路正常"
+        log "Recover-Flap 成功: $(smart_monitor_status_message)"
+        return 0
+    fi
+
+    log "Recover-Flap 最终失败: status=${status:-empty}, cause=${cause:-empty}"
+    write_status "fail" "ok" "fail" "fail" "$exp" "一键恢复波动失败: ${cause:-unknown}"
+    return 1
+}
+
 stop_codex_gcp_egress() {
     if [ ! -x "$CODEX_REFRESH_SCRIPT" ]; then
         log "失败, Codex 修复脚本不存在或不可执行: $CODEX_REFRESH_SCRIPT"
@@ -879,7 +953,7 @@ Would:
   - run codex-gcp-monitor sample and read ${MONITOR_LATEST_FILE}
   - refresh Kerberos/SSH only if monitor reports a remote SSH failure
   - choose the smallest matching GCP repair:
-      local_1080_missing/gcp_tcp_fail        -> codex-gcp-remote --dry-run repair-local-socks
+      local_1080_missing/local_1080_bad/gcp -> codex-gcp-remote --dry-run repair-local-socks
       local_7890_missing/local_7890_bad     -> codex-gcp-remote --dry-run repair-local-http
       remote_10800/chatgpt data-plane issue -> codex-gcp-remote --dry-run repair-remote-forward
       many stale remote 10800 sockets       -> codex-gcp-remote --dry-run repair-remote-sockets
@@ -887,6 +961,17 @@ Would:
       version/wrapper drift                 -> codex-gcp-remote --dry-run deep-repair
   - avoid restarting remote Codex app-server except for explicit stale runtime or deep repair
 EOF
+            ;;
+        recover-flap)
+            cat <<EOF
+Would:
+  - run codex-gcp-remote --dry-run debug-fast as the smallest live-path snapshot/repair
+  - sample codex-gcp-monitor and classify local 1080, local 7890, remote 10800, ChatGPT, and socket storm state
+  - run smart-repair only if the monitor is still unhealthy
+  - clear dangerous remote 10800 stale sockets only after the local data plane is healthy
+  - finish with codex-gcp-remote --dry-run verify-fast and a final monitor sample
+EOF
+            CODEX_GCP_DRY_RUN=1 "$CODEX_REFRESH_SCRIPT" --dry-run debug-fast 2>/dev/null || true
             ;;
         stop-gcp)
             echo "Would run: codex-gcp-remote --dry-run limit-egress"
@@ -956,6 +1041,9 @@ case "${1:-}" in
     smart|smart-repair|one-click|oneclick|fix|repair)
         MODE="smart-repair"
         ;;
+    recover-flap|flap|one-click-recover|recover|perfect-recover)
+        MODE="recover-flap"
+        ;;
     stop-gcp|stop-egress|limit-gcp|limit-egress)
         MODE="stop-gcp"
         ;;
@@ -969,7 +1057,7 @@ case "${1:-}" in
         MODE="full"
         ;;
     *)
-        echo "Usage: kinit-refresh [--dry-run] [status|log|save-password|delete-password|ssh-only|smart-repair|remote-gcp|stop-gcp]" >&2
+        echo "Usage: kinit-refresh [--dry-run] [status|log|save-password|delete-password|ssh-only|smart-repair|recover-flap|remote-gcp|stop-gcp]" >&2
         exit 2
         ;;
 esac
@@ -996,6 +1084,17 @@ if [ "$MODE" = "smart-repair" ]; then
         [ -t 1 ] && echo "智能修复完成"
     else
         [ -t 1 ] && echo "智能修复失败 (exit ${RC}), 详见 ${LOG_FILE}"
+    fi
+    exit "$RC"
+fi
+
+if [ "$MODE" = "recover-flap" ]; then
+    recover_flap
+    RC=$?
+    if [ "$RC" -eq 0 ]; then
+        [ -t 1 ] && echo "一键恢复波动完成"
+    else
+        [ -t 1 ] && echo "一键恢复波动失败 (exit ${RC}), 详见 ${LOG_FILE}"
     fi
     exit "$RC"
 fi

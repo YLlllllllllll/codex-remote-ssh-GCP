@@ -27,6 +27,7 @@ final class StatusApp: NSObject, NSApplicationDelegate {
     private let staleSeconds: TimeInterval = 20 * 60
     private var timer: Timer?
     private let summaryItem = NSMenuItem(title: "刷新状态中...", action: nil, keyEquivalent: "")
+    private let recoverFlapItem = NSMenuItem(title: "一键恢复波动", action: #selector(recoverFlap), keyEquivalent: "f")
     private let smartRepairItem = NSMenuItem(title: "智能修复", action: #selector(smartRepairGCP), keyEquivalent: "g")
     private let verifyGCPItem = NSMenuItem(title: "验证 GCP", action: #selector(verifyGCP), keyEquivalent: "v")
     private let diagnoseGCPItem = NSMenuItem(title: "诊断 GCP", action: #selector(diagnoseGCP), keyEquivalent: "d")
@@ -55,6 +56,7 @@ final class StatusApp: NSObject, NSApplicationDelegate {
         let menu = NSMenu()
         menu.addItem(summaryItem)
         menu.addItem(NSMenuItem.separator())
+        menu.addItem(recoverFlapItem)
         menu.addItem(smartRepairItem)
         sessionsItem.submenu = sessionsMenu
         menu.addItem(sessionsItem)
@@ -127,6 +129,8 @@ final class StatusApp: NSObject, NSApplicationDelegate {
         let gcpState = monitorGcpOk ? "GCP 可用" : message
         summaryItem.title = "\(detailTitle) | Kinit: \(kinitLabel) | SSH: \(ssh) | \(gcpState)"
         summaryItem.toolTip = "Proxy: \(proxy) | Codex: \(codex) | 更新: \(updated) | \(trafficLabel)"
+        recoverFlapItem.title = "一键恢复波动    \(trafficLabel)"
+        recoverFlapItem.toolTip = "点击后执行 debug-fast、精准修复、verify-fast 和最终 monitor sample；用于 Codex reconnecting、ChatGPT 000、本地 1080 卡死、remote 10800 socket storm"
         smartRepairItem.title = "智能修复    \(trafficLabel)"
         smartRepairItem.toolTip = "先诊断再选择最小修复动作；\(trafficTooltip(traffic))"
         verifyGCPItem.toolTip = "只验证本地 1080/7890、远程 10800、GCP 出口 IP 和 ChatGPT Codex endpoint，不重建链路"
@@ -378,6 +382,10 @@ final class StatusApp: NSObject, NSApplicationDelegate {
 
     @objc private func smartRepairGCP() {
         runRefresh(title: "🟡KC", arguments: ["smart-repair"])
+    }
+
+    @objc private func recoverFlap() {
+        runRefresh(title: "🟡KC", arguments: ["recover-flap"])
     }
 
     @objc private func verifyGCP() {

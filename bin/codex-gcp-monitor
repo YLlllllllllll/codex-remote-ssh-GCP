@@ -27,6 +27,7 @@ REMOTE_HOST="${REMOTE_HOST:-${SSH_PROBE_TARGET:-remote-workspace.example.invalid
 
 LOCAL_HTTP_HOST="${LOCAL_HTTP_HOST:-127.0.0.1}"
 LOCAL_HTTP_PORT="${LOCAL_HTTP_PORT:-7890}"
+LOCAL_SOCKS_HOST="${LOCAL_SOCKS_HOST:-127.0.0.1}"
 LOCAL_SOCKS_PORT="${LOCAL_SOCKS_PORT:-1080}"
 REMOTE_HTTP_HOST="${REMOTE_HTTP_HOST:-127.0.0.1}"
 REMOTE_HTTP_PORT="${REMOTE_HTTP_PORT:-10800}"
@@ -44,15 +45,52 @@ INCIDENT_DIR="${MONITOR_INCIDENT_DIR:-$STATE_DIR/incidents}"
 INCIDENT_INDEX_FILE="${MONITOR_INCIDENT_INDEX_FILE:-$INCIDENT_DIR/incidents.jsonl}"
 INCIDENT_LAST_FILE="${MONITOR_INCIDENT_LAST_FILE:-$INCIDENT_DIR/last.env}"
 INCIDENT_MIN_INTERVAL_SECONDS="${MONITOR_INCIDENT_MIN_INTERVAL_SECONDS:-60}"
+MONITOR_LOCK_DIR="${MONITOR_LOCK_DIR:-$STATE_DIR/monitor.lock}"
 LOCAL_HTTP_URL="http://${LOCAL_HTTP_HOST}:${LOCAL_HTTP_PORT}"
+LOCAL_SOCKS_URL="socks5h://${LOCAL_SOCKS_HOST}:${LOCAL_SOCKS_PORT}"
 REMOTE_HTTP_URL="http://${REMOTE_HTTP_HOST}:${REMOTE_HTTP_PORT}"
 
 json_escape() {
-  sed 's/\\/\\\\/g; s/"/\\"/g; s/	/\\t/g' | tr '\n' ' '
+  python3 -c 'import json, sys; print(json.dumps(sys.stdin.read(), ensure_ascii=False)[1:-1], end="")'
 }
 
 json_value() {
   printf '%s' "$1" | json_escape
+}
+
+acquire_monitor_lock() {
+  mkdir -p "$STATE_DIR"
+  if mkdir "$MONITOR_LOCK_DIR" 2>/dev/null; then
+    printf '%s\n' "$$" > "$MONITOR_LOCK_DIR/pid"
+    date '+%Y-%m-%d %H:%M:%S' > "$MONITOR_LOCK_DIR/started"
+    return 0
+  fi
+
+  local owner_pid
+  owner_pid="$(head -n 1 "$MONITOR_LOCK_DIR/pid" 2>/dev/null || true)"
+  case "$owner_pid" in
+    ''|*[!0-9]*)
+      rm -rf "$MONITOR_LOCK_DIR" 2>/dev/null || true
+      ;;
+    *)
+      if ! kill -0 "$owner_pid" 2>/dev/null; then
+        rm -rf "$MONITOR_LOCK_DIR" 2>/dev/null || true
+      fi
+      ;;
+  esac
+
+  if mkdir "$MONITOR_LOCK_DIR" 2>/dev/null; then
+    printf '%s\n' "$$" > "$MONITOR_LOCK_DIR/pid"
+    date '+%Y-%m-%d %H:%M:%S' > "$MONITOR_LOCK_DIR/started"
+    return 0
+  fi
+
+  return 1
+}
+
+release_monitor_lock() {
+  rm -f "$MONITOR_LOCK_DIR/pid" "$MONITOR_LOCK_DIR/started" 2>/dev/null || true
+  rmdir "$MONITOR_LOCK_DIR" 2>/dev/null || true
 }
 
 route_field() {
@@ -92,6 +130,12 @@ listener_count() {
 curl_local_http_ip() {
   curl -sS --connect-timeout "$MONITOR_CONNECT_TIMEOUT" --max-time "$MONITOR_MAX_TIME" \
     -x "$LOCAL_HTTP_URL" "$IP_CHECK_URL" 2>/dev/null || true
+}
+
+curl_local_socks_ip() {
+  ALL_PROXY="$LOCAL_SOCKS_URL" \
+    curl -sS --connect-timeout "$MONITOR_CONNECT_TIMEOUT" --max-time "$MONITOR_MAX_TIME" \
+      "$IP_CHECK_URL" 2>/dev/null || true
 }
 
 tcp_check() {
@@ -527,7 +571,7 @@ sample() {
   rotate_if_needed
 
   local ts epoch default_iface default_gateway gcp_iface gcp_gateway gcp_bind
-  local socks_count http_count socks_pids http_pids local_http_ip gcp_tcp
+  local socks_count http_count socks_pids http_pids local_socks_ip local_http_ip gcp_tcp
   local remote_rc remote_output remote_error remote_err_file remote_listen remote_proxy_ip chatgpt_code remote_app_count remote_notty_count
   local remote_10800_socket_count remote_10800_active_socket_count remote_10800_stale_socket_count remote_10800_danger_stale_socket_count remote_10800_close_wait_socket_count remote_10800_fin_wait_socket_count remote_10800_time_wait_socket_count remote_codex_exec_count remote_session_detail
   local status cause status_file_status status_file_message
@@ -547,6 +591,7 @@ sample() {
   http_count="$(listener_count "$LOCAL_HTTP_PORT")"
   socks_pids="$(listener_pids "$LOCAL_SOCKS_PORT")"
   http_pids="$(listener_pids "$LOCAL_HTTP_PORT")"
+  local_socks_ip="$(curl_local_socks_ip)"
   local_http_ip="$(curl_local_http_ip)"
   gcp_tcp="$(tcp_check)"
   gcp_counter_output="$(gcp_counter_probe)"
@@ -642,6 +687,8 @@ sample() {
     status="fail"; cause="local_1080_missing"
   elif [[ "$http_count" == "0" ]]; then
     status="fail"; cause="local_7890_missing"
+  elif [[ "$local_socks_ip" != "$GCP_EXPECTED_IP" && "$remote_chain_ok" != "1" ]]; then
+    status="fail"; cause="local_1080_bad_egress"
   elif [[ "$local_http_ip" != "$GCP_EXPECTED_IP" && "$remote_chain_ok" != "1" ]]; then
     status="fail"; cause="local_7890_bad_egress"
   elif [[ "$gcp_tcp" != "ok" && "$remote_chain_ok" != "1" ]]; then
@@ -662,6 +709,7 @@ STATUS=$status
 CAUSE=$cause
 GCP_TCP=$gcp_tcp
 LOCAL_1080_COUNT=$socks_count
+LOCAL_1080_IP=$local_socks_ip
 LOCAL_7890_COUNT=$http_count
 LOCAL_7890_IP=$local_http_ip
 REMOTE_SSH_RC=$remote_rc
@@ -723,6 +771,7 @@ EOF
   printf '"traffic_status":"%s",' "$(json_value "$traffic_status")"
   printf '"local_1080_count":%s,' "${socks_count:-0}"
   printf '"local_1080_pids":"%s",' "$(json_value "$socks_pids")"
+  printf '"local_1080_ip":"%s",' "$(json_value "$local_socks_ip")"
   printf '"local_7890_count":%s,' "${http_count:-0}"
   printf '"local_7890_pids":"%s",' "$(json_value "$http_pids")"
   printf '"local_7890_ip":"%s",' "$(json_value "$local_http_ip")"
@@ -732,6 +781,10 @@ EOF
   printf '"remote_10800_socket_count":%s,' "${remote_10800_socket_count:-0}"
   printf '"remote_10800_active_socket_count":%s,' "${remote_10800_active_socket_count:-0}"
   printf '"remote_10800_stale_socket_count":%s,' "${remote_10800_stale_socket_count:-0}"
+  printf '"remote_10800_danger_stale_socket_count":%s,' "${remote_10800_danger_stale_socket_count:-0}"
+  printf '"remote_10800_close_wait_socket_count":%s,' "${remote_10800_close_wait_socket_count:-0}"
+  printf '"remote_10800_fin_wait_socket_count":%s,' "${remote_10800_fin_wait_socket_count:-0}"
+  printf '"remote_10800_time_wait_socket_count":%s,' "${remote_10800_time_wait_socket_count:-0}"
   printf '"remote_10800_ip":"%s",' "$(json_value "$remote_proxy_ip")"
   printf '"chatgpt_code":"%s",' "$(json_value "$chatgpt_code")"
   printf '"remote_codex_exec_count":%s,' "${remote_codex_exec_count:-0}"
@@ -766,12 +819,23 @@ EOF
     return 1
   fi
 
+  local escaped
+  escaped="$(printf 'quote" slash\\ cr\r tab\t 中文' | json_escape)"
+  JSON_ESCAPED="$escaped" python3 - <<'PY'
+import json
+import os
+json.loads('{"v":"%s"}' % os.environ["JSON_ESCAPED"])
+PY
+
   printf 'codex-gcp-monitor self-test: ok\n'
 }
 
 case "${1:-sample}" in
   sample)
-    sample >> "$LOG_FILE"
+    if acquire_monitor_lock; then
+      trap release_monitor_lock EXIT
+      sample >> "$LOG_FILE"
+    fi
     ;;
   status)
     if [[ -f "$LATEST_FILE" ]]; then

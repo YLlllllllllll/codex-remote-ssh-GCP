@@ -17,6 +17,7 @@ LATEST_FILE="${MONITOR_LATEST_FILE:-$STATE_DIR/monitor-latest.env}"
 MONITOR_LOG_FILE="${MONITOR_LOG_FILE:-$STATE_DIR/monitor.jsonl}"
 AUTOHEAL_LOG_FILE="${AUTOHEAL_LOG_FILE:-$STATE_DIR/autoheal.log}"
 AUTOHEAL_LAST_FILE="${AUTOHEAL_LAST_FILE:-$STATE_DIR/autoheal.last}"
+AUTOHEAL_TARGETED_LAST_FILE="${AUTOHEAL_TARGETED_LAST_FILE:-$STATE_DIR/autoheal.targeted.last}"
 AUTOHEAL_SOCKET_STORM_LAST_FILE="${AUTOHEAL_SOCKET_STORM_LAST_FILE:-$STATE_DIR/autoheal.socket-storm.last}"
 GCP_ENABLED_FILE="${GCP_ENABLED_FILE:-$STATE_DIR/gcp.enabled}"
 KINIT_SCRIPT="${KINIT_SCRIPT:-$LOCAL_HOME/bin/kinit-refresh}"
@@ -28,11 +29,14 @@ REPAIR_LOCK_DIR="${REPAIR_LOCK_DIR:-$STATE_DIR/repair.lock}"
 CODEX_GCP_AUTOHEAL_ENABLED="${CODEX_GCP_AUTOHEAL_ENABLED:-1}"
 AUTOHEAL_MIN_CONSECUTIVE_FAILS="${AUTOHEAL_MIN_CONSECUTIVE_FAILS:-2}"
 AUTOHEAL_COOLDOWN_SECONDS="${AUTOHEAL_COOLDOWN_SECONDS:-900}"
+AUTOHEAL_TARGETED_COOLDOWN_SECONDS="${AUTOHEAL_TARGETED_COOLDOWN_SECONDS:-90}"
 AUTOHEAL_SOCKET_STORM_COOLDOWN_SECONDS="${AUTOHEAL_SOCKET_STORM_COOLDOWN_SECONDS:-120}"
 AUTOHEAL_MAX_SAMPLE_AGE_SECONDS="${AUTOHEAL_MAX_SAMPLE_AGE_SECONDS:-300}"
 AUTOHEAL_REPAIR_MODE="${AUTOHEAL_REPAIR_MODE:-remote-gcp}"
 AUTOHEAL_STALE_SOCKET_THRESHOLD="${AUTOHEAL_STALE_SOCKET_THRESHOLD:-20}"
 AUTOHEAL_ALLOW_APP_SERVER_RESTART="${AUTOHEAL_ALLOW_APP_SERVER_RESTART:-0}"
+AUTOHEAL_BAD_EGRESS_CONSECUTIVE_FAILS="${AUTOHEAL_BAD_EGRESS_CONSECUTIVE_FAILS:-2}"
+AUTOHEAL_CHATGPT_CONSECUTIVE_FAILS="${AUTOHEAL_CHATGPT_CONSECUTIVE_FAILS:-2}"
 
 log() {
   mkdir -p "$STATE_DIR"
@@ -82,7 +86,7 @@ gcp_intended_on() {
 
 cause_autohealable() {
   case "${1:-}" in
-    local_1080_missing|local_7890_missing|local_7890_bad_egress|remote_10800_missing|remote_10800_bad_egress|chatgpt_unreachable_*)
+    local_1080_missing|local_1080_bad_egress|local_7890_missing|local_7890_bad_egress|remote_10800_missing|remote_10800_bad_egress|chatgpt_unreachable_*)
       return 0
       ;;
     *)
@@ -163,7 +167,7 @@ cooldown_remaining() {
 }
 
 should_autoheal() {
-  local status cause fails remaining stale_sockets danger_stale_sockets active_sockets remote_count local_http_ip
+  local status cause fails remaining stale_sockets danger_stale_sockets active_sockets remote_count http_count local_http_ip required_fails
 
   [[ "$CODEX_GCP_AUTOHEAL_ENABLED" == "1" ]] || {
     printf 'skip: autoheal disabled\n'
@@ -188,8 +192,14 @@ should_autoheal() {
   danger_stale_sockets="$(number_or_zero "$(kv_value REMOTE_10800_DANGER_STALE_SOCKET_COUNT)")"
   active_sockets="$(number_or_zero "$(kv_value REMOTE_10800_ACTIVE_SOCKET_COUNT)")"
   remote_count="$(number_or_zero "$(kv_value REMOTE_10800_COUNT)")"
+  http_count="$(number_or_zero "$(kv_value LOCAL_7890_COUNT)")"
   local_http_ip="$(kv_value LOCAL_7890_IP)"
-  if [[ "$danger_stale_sockets" -ge "$AUTOHEAL_STALE_SOCKET_THRESHOLD" ]]; then
+  local_socks_ip="$(kv_value LOCAL_1080_IP)"
+  if [[ "$danger_stale_sockets" -ge "$AUTOHEAL_STALE_SOCKET_THRESHOLD" &&
+        "$cause" != "local_1080_missing" &&
+        "$cause" != "local_1080_bad_egress" &&
+        "$cause" != "local_7890_missing" &&
+        "$cause" != "local_7890_bad_egress" ]]; then
     if [[ "$status" != "fail" ]]; then
       printf 'skip: dangerous stale sockets above threshold but data plane is still ok danger_stale=%s stale=%s active=%s threshold=%s\n' "$danger_stale_sockets" "$stale_sockets" "$active_sockets" "$AUTOHEAL_STALE_SOCKET_THRESHOLD"
       return 1
@@ -202,9 +212,22 @@ should_autoheal() {
     printf 'heal: cause=remote_10800_socket_storm danger_stale_sockets=%s stale_sockets=%s active_sockets=%s threshold=%s status=%s\n' "$danger_stale_sockets" "$stale_sockets" "$active_sockets" "$AUTOHEAL_STALE_SOCKET_THRESHOLD" "$status"
     return 0
   fi
-  if [[ "$stale_sockets" -ge "$AUTOHEAL_STALE_SOCKET_THRESHOLD" ]]; then
+  if [[ "$stale_sockets" -ge "$AUTOHEAL_STALE_SOCKET_THRESHOLD" &&
+        "$cause" != "local_1080_missing" &&
+        "$cause" != "local_1080_bad_egress" &&
+        "$cause" != "local_7890_missing" &&
+        "$cause" != "local_7890_bad_egress" ]]; then
     printf 'skip: stale sockets above threshold are not dangerous enough stale=%s danger_stale=%s active=%s threshold=%s\n' "$stale_sockets" "$danger_stale_sockets" "$active_sockets" "$AUTOHEAL_STALE_SOCKET_THRESHOLD"
     return 1
+  fi
+  if [[ "$status" == "ok" && "$http_count" -gt 0 && -n "${GCP_EXPECTED_IP:-}" && -n "$local_http_ip" && "$local_http_ip" != "$GCP_EXPECTED_IP" ]]; then
+    remaining="$(number_or_zero "$(cooldown_remaining "$AUTOHEAL_TARGETED_LAST_FILE" "$AUTOHEAL_TARGETED_COOLDOWN_SECONDS")")"
+    if [[ "$remaining" -gt 0 ]]; then
+      printf 'skip: targeted cooldown %ss remaining for local_7890_degraded\n' "$remaining"
+      return 1
+    fi
+    printf 'heal: cause=local_http_repair monitor_cause=local_7890_degraded status=%s local_http_ip=%s\n' "$status" "${local_http_ip:-empty}"
+    return 0
   fi
   [[ "$status" == "fail" ]] || {
     printf 'skip: monitor status %s\n' "${status:-unknown}"
@@ -215,11 +238,92 @@ should_autoheal() {
     return 1
   }
 
+  required_fails="$AUTOHEAL_MIN_CONSECUTIVE_FAILS"
+  case "$cause" in
+    local_1080_missing|local_1080_bad_egress|local_7890_missing|remote_10800_missing)
+      required_fails=1
+      ;;
+    local_7890_bad_egress|remote_10800_bad_egress)
+      required_fails="$AUTOHEAL_BAD_EGRESS_CONSECUTIVE_FAILS"
+      ;;
+    chatgpt_unreachable_*)
+      required_fails="$AUTOHEAL_CHATGPT_CONSECUTIVE_FAILS"
+      ;;
+  esac
   fails="$(number_or_zero "$(consecutive_fail_count)")"
-  if [[ "$fails" -lt "$AUTOHEAL_MIN_CONSECUTIVE_FAILS" ]]; then
-    printf 'skip: only %s consecutive failures, need %s\n' "$fails" "$AUTOHEAL_MIN_CONSECUTIVE_FAILS"
+  if [[ "$fails" -lt "$required_fails" ]]; then
+    printf 'skip: only %s consecutive failures, need %s\n' "$fails" "$required_fails"
     return 1
   fi
+
+  case "$cause" in
+    local_1080_missing)
+      remaining="$(number_or_zero "$(cooldown_remaining "$AUTOHEAL_TARGETED_LAST_FILE" "$AUTOHEAL_TARGETED_COOLDOWN_SECONDS")")"
+      if [[ "$remaining" -gt 0 ]]; then
+        printf 'skip: targeted cooldown %ss remaining\n' "$remaining"
+        return 1
+      fi
+      printf 'heal: cause=local_socks_repair monitor_cause=%s consecutive_failures=%s\n' "$cause" "$fails"
+      return 0
+      ;;
+    local_1080_bad_egress)
+      remaining="$(number_or_zero "$(cooldown_remaining "$AUTOHEAL_TARGETED_LAST_FILE" "$AUTOHEAL_TARGETED_COOLDOWN_SECONDS")")"
+      if [[ "$remaining" -gt 0 ]]; then
+        printf 'skip: targeted cooldown %ss remaining\n' "$remaining"
+        return 1
+      fi
+      printf 'heal: cause=local_http_repair monitor_cause=%s consecutive_failures=%s local_socks_ip=%s\n' "$cause" "$fails" "${local_socks_ip:-empty}"
+      return 0
+      ;;
+    local_7890_missing|local_7890_bad_egress)
+      remaining="$(number_or_zero "$(cooldown_remaining "$AUTOHEAL_TARGETED_LAST_FILE" "$AUTOHEAL_TARGETED_COOLDOWN_SECONDS")")"
+      if [[ "$remaining" -gt 0 ]]; then
+        printf 'skip: targeted cooldown %ss remaining\n' "$remaining"
+        return 1
+      fi
+      printf 'heal: cause=local_http_repair monitor_cause=%s consecutive_failures=%s\n' "$cause" "$fails"
+      return 0
+      ;;
+    remote_10800_missing)
+      remaining="$(number_or_zero "$(cooldown_remaining "$AUTOHEAL_TARGETED_LAST_FILE" "$AUTOHEAL_TARGETED_COOLDOWN_SECONDS")")"
+      if [[ "$remaining" -gt 0 ]]; then
+        printf 'skip: targeted cooldown %ss remaining\n' "$remaining"
+        return 1
+      fi
+      printf 'heal: cause=remote_forward_repair monitor_cause=%s consecutive_failures=%s\n' "$cause" "$fails"
+      return 0
+      ;;
+    remote_10800_bad_egress)
+      remaining="$(number_or_zero "$(cooldown_remaining "$AUTOHEAL_TARGETED_LAST_FILE" "$AUTOHEAL_TARGETED_COOLDOWN_SECONDS")")"
+      if [[ "$remaining" -gt 0 ]]; then
+        printf 'skip: targeted cooldown %ss remaining\n' "$remaining"
+        return 1
+      fi
+      if [[ -n "${GCP_EXPECTED_IP:-}" && -n "$local_socks_ip" && "$local_socks_ip" != "$GCP_EXPECTED_IP" ]]; then
+        printf 'heal: cause=local_http_repair monitor_cause=%s consecutive_failures=%s local_socks_ip=%s\n' "$cause" "$fails" "$local_socks_ip"
+      elif [[ "$local_http_ip" == "${GCP_EXPECTED_IP:-}" ]]; then
+        printf 'heal: cause=remote_forward_repair monitor_cause=%s consecutive_failures=%s\n' "$cause" "$fails"
+      else
+        printf 'heal: cause=local_http_repair monitor_cause=%s consecutive_failures=%s local_http_ip=%s\n' "$cause" "$fails" "${local_http_ip:-empty}"
+      fi
+      return 0
+      ;;
+    chatgpt_unreachable_*)
+      remaining="$(number_or_zero "$(cooldown_remaining "$AUTOHEAL_TARGETED_LAST_FILE" "$AUTOHEAL_TARGETED_COOLDOWN_SECONDS")")"
+      if [[ "$remaining" -gt 0 ]]; then
+        printf 'skip: targeted cooldown %ss remaining\n' "$remaining"
+        return 1
+      fi
+      if [[ -n "${GCP_EXPECTED_IP:-}" && -n "$local_socks_ip" && "$local_socks_ip" != "$GCP_EXPECTED_IP" ]]; then
+        printf 'heal: cause=local_http_repair monitor_cause=%s consecutive_failures=%s local_socks_ip=%s\n' "$cause" "$fails" "$local_socks_ip"
+      elif [[ "$remote_count" -gt 0 && "$local_http_ip" == "${GCP_EXPECTED_IP:-}" ]]; then
+        printf 'heal: cause=remote_10800_data_plane_repair_remote_sockets monitor_cause=%s stale_sockets=%s consecutive_failures=%s\n' "$cause" "$stale_sockets" "$fails"
+      else
+        printf 'heal: cause=local_http_repair monitor_cause=%s consecutive_failures=%s local_http_ip=%s\n' "$cause" "$fails" "${local_http_ip:-empty}"
+      fi
+      return 0
+      ;;
+  esac
 
   remaining="$(number_or_zero "$(cooldown_remaining)")"
   if [[ "$remaining" -gt 0 ]]; then
@@ -316,8 +420,25 @@ run_once() {
     return 0
   fi
 
-  printf '%s\n' "$(date +%s)" > "$AUTOHEAL_LAST_FILE"
   log "start: $decision"
+  if [[ "$decision" == *"cause=remote_10800_data_plane_repair_remote_sockets"* ]]; then
+    if "$REMOTE_SCRIPT" verify-fast >> "$AUTOHEAL_LOG_FILE" 2>&1; then
+      log "preflight verify-fast ok; skip remote socket reset"
+      release_lock
+      printf 'autoheal skipped: preflight verify-fast ok\n'
+      return 0
+    fi
+    log "preflight verify-fast failed; continuing with remote socket repair"
+  fi
+
+  case "$decision" in
+    *"cause=local_socks_repair"*|*"cause=local_http_repair"*|*"cause=remote_forward_repair"*|*"cause=remote_10800_data_plane_repair_remote_sockets"*)
+      printf '%s\n' "$(date +%s)" > "$AUTOHEAL_TARGETED_LAST_FILE"
+      ;;
+    *)
+      printf '%s\n' "$(date +%s)" > "$AUTOHEAL_LAST_FILE"
+      ;;
+  esac
   rc=0
   if [[ "$decision" == *"cause=remote_10800_socket_storm"* ]]; then
     printf '%s\n' "$(date +%s)" > "$AUTOHEAL_SOCKET_STORM_LAST_FILE"
@@ -342,6 +463,24 @@ run_once() {
     else
       rc=$?
     fi
+  elif [[ "$decision" == *"cause=local_socks_repair"* ]]; then
+    if "$REMOTE_SCRIPT" repair-local-socks >> "$AUTOHEAL_LOG_FILE" 2>&1; then
+      rc=0
+    else
+      rc=$?
+    fi
+  elif [[ "$decision" == *"cause=local_http_repair"* ]]; then
+    if "$REMOTE_SCRIPT" repair-local-http >> "$AUTOHEAL_LOG_FILE" 2>&1; then
+      rc=0
+    else
+      rc=$?
+    fi
+  elif [[ "$decision" == *"cause=remote_forward_repair"* ]]; then
+    if "$REMOTE_SCRIPT" repair-remote-forward >> "$AUTOHEAL_LOG_FILE" 2>&1; then
+      rc=0
+    else
+      rc=$?
+    fi
   else
     if "$REMOTE_SCRIPT" repair-fast >> "$AUTOHEAL_LOG_FILE" 2>&1; then
       rc=0
@@ -356,8 +495,9 @@ run_once() {
   post_cause="$(kv_value CAUSE)"
   if [[ "$post_status" == "fail" ]]; then
     rm -f "$AUTOHEAL_LAST_FILE" 2>/dev/null || true
+    rm -f "$AUTOHEAL_TARGETED_LAST_FILE" 2>/dev/null || true
     case "$post_cause" in
-      local_1080_missing|local_7890_missing|local_7890_bad_egress|remote_10800_missing|remote_10800_bad_egress|chatgpt_unreachable_*)
+      local_1080_missing|local_1080_bad_egress|local_7890_missing|local_7890_bad_egress|remote_10800_missing|remote_10800_bad_egress|chatgpt_unreachable_*)
         rm -f "$AUTOHEAL_SOCKET_STORM_LAST_FILE" 2>/dev/null || true
         ;;
     esac
@@ -373,8 +513,11 @@ status() {
   printf 'enabled=%s\n' "$CODEX_GCP_AUTOHEAL_ENABLED"
   printf 'min_consecutive_failures=%s\n' "$AUTOHEAL_MIN_CONSECUTIVE_FAILS"
   printf 'cooldown_seconds=%s\n' "$AUTOHEAL_COOLDOWN_SECONDS"
+  printf 'targeted_cooldown_seconds=%s\n' "$AUTOHEAL_TARGETED_COOLDOWN_SECONDS"
   printf 'socket_storm_cooldown_seconds=%s\n' "$AUTOHEAL_SOCKET_STORM_COOLDOWN_SECONDS"
   printf 'stale_socket_threshold=%s\n' "$AUTOHEAL_STALE_SOCKET_THRESHOLD"
+  printf 'bad_egress_consecutive_failures=%s\n' "$AUTOHEAL_BAD_EGRESS_CONSECUTIVE_FAILS"
+  printf 'chatgpt_consecutive_failures=%s\n' "$AUTOHEAL_CHATGPT_CONSECUTIVE_FAILS"
   printf 'allow_app_server_restart=%s\n' "$AUTOHEAL_ALLOW_APP_SERVER_RESTART"
   printf 'latest_decision=%s\n' "$(should_autoheal 2>/dev/null || true)"
   if [[ -f "$AUTOHEAL_LOG_FILE" ]]; then
@@ -392,14 +535,18 @@ self_test() {
   MONITOR_LOG_FILE="$tmp/monitor.jsonl"
   AUTOHEAL_LOG_FILE="$tmp/autoheal.log"
   AUTOHEAL_LAST_FILE="$tmp/autoheal.last"
+  AUTOHEAL_TARGETED_LAST_FILE="$tmp/autoheal.targeted.last"
   AUTOHEAL_SOCKET_STORM_LAST_FILE="$tmp/autoheal.socket-storm.last"
   GCP_ENABLED_FILE="$tmp/gcp.enabled"
   AUTOHEAL_LOCK_DIR="$tmp/autoheal.lock"
   CODEX_GCP_AUTOHEAL_ENABLED=1
   AUTOHEAL_MIN_CONSECUTIVE_FAILS=2
   AUTOHEAL_COOLDOWN_SECONDS=900
+  AUTOHEAL_TARGETED_COOLDOWN_SECONDS=90
   AUTOHEAL_SOCKET_STORM_COOLDOWN_SECONDS=120
   AUTOHEAL_MAX_SAMPLE_AGE_SECONDS=300
+  AUTOHEAL_BAD_EGRESS_CONSECUTIVE_FAILS=2
+  AUTOHEAL_CHATGPT_CONSECUTIVE_FAILS=2
 
   mkdir -p "$tmp"
   {
@@ -426,9 +573,33 @@ self_test() {
     return 1
   }
   case "$decision" in
-    heal:*) ;;
+    *"cause=local_http_repair"*) ;;
     *)
       printf 'autoheal self-test failed: unexpected decision=%s\n' "$decision" >&2
+      return 1
+      ;;
+  esac
+
+  {
+    printf 'STATUS=fail\n'
+    printf 'CAUSE=local_1080_bad_egress\n'
+    printf 'LOCAL_1080_COUNT=1\n'
+    printf 'LOCAL_1080_IP=\n'
+    printf 'LOCAL_7890_COUNT=1\n'
+    printf 'LOCAL_7890_IP=\n'
+    printf 'REMOTE_10800_COUNT=1\n'
+    printf 'REMOTE_10800_DANGER_STALE_SOCKET_COUNT=30\n'
+    printf 'REMOTE_10800_STALE_SOCKET_COUNT=30\n'
+    printf 'REMOTE_10800_ACTIVE_SOCKET_COUNT=8\n'
+  } > "$LATEST_FILE"
+  decision="$(should_autoheal)" || {
+    printf 'autoheal self-test failed: local socks decision=%s\n' "$decision" >&2
+    return 1
+  }
+  case "$decision" in
+    *"cause=local_http_repair"*"monitor_cause=local_1080_bad_egress"*) ;;
+    *)
+      printf 'autoheal self-test failed: local socks priority decision=%s\n' "$decision" >&2
       return 1
       ;;
   esac
@@ -439,6 +610,17 @@ self_test() {
     printf 'autoheal self-test failed: cooldown=%s\n' "$remaining" >&2
     return 1
   }
+
+  printf '%s\n' "$(date +%s)" > "$AUTOHEAL_TARGETED_LAST_FILE"
+  decision="$(should_autoheal || true)"
+  case "$decision" in
+    "skip: targeted cooldown "*)
+      ;;
+    *)
+      printf 'autoheal self-test failed: targeted cooldown decision=%s\n' "$decision" >&2
+      return 1
+      ;;
+  esac
 
   printf 'codex-gcp-autoheal self-test: ok\n'
 }

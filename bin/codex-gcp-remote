@@ -1036,6 +1036,9 @@ set -Eeuo pipefail
 [[ "$(head -1 "$HOME/.local/node/lib/node_modules/@openai/codex/bin/codex.js" 2>/dev/null)" == "#!/usr/bin/env node" ]]
 grep -q 'Inner guard' "$HOME/.local/node/bin/codex"
 grep -q '127\.0\.0\.1:10800' "$HOME/.codex/proxy.env"
+grep -q '\.bytedance\.net' "$HOME/.codex/proxy.env"
+grep -q '\.bytedance\.net' "$HOME/.local/bin/codex-gcp"
+grep -q '\.bytedance\.net' "$HOME/.local/node/bin/codex"
 ! grep -Eq '127\.0\.0\.1:18080|127\.0\.0\.1:18081|modelhub|azure|OPENAI_BASE_URL|custom-provider\.example' "$HOME/.codex/proxy.env"
 if [[ -f "$HOME/.codex/config.toml" ]]; then
   ! grep -Eq 'model_provider|model_providers|OPENAI_BASE_URL|custom-provider\.example|azure|modelhub|127\.0\.0\.1:18080|127\.0\.0\.1:18081' "$HOME/.codex/config.toml"
@@ -1074,8 +1077,8 @@ ALL_PROXY=http://127.0.0.1:10800
 http_proxy=http://127.0.0.1:10800
 https_proxy=http://127.0.0.1:10800
 all_proxy=http://127.0.0.1:10800
-NO_PROXY=localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.internal.example.invalid
-no_proxy=localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.internal.example.invalid
+NO_PROXY=localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.bytedance.net,bytedance.net,.byted.org,byted.org,.internal.example.invalid
+no_proxy=localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.bytedance.net,bytedance.net,.byted.org,byted.org,.internal.example.invalid
 EOF
 chmod 600 "$HOME/.codex/proxy.env"
 
@@ -1110,7 +1113,7 @@ export ALL_PROXY="http://127.0.0.1:10800"
 export http_proxy="$HTTP_PROXY"
 export https_proxy="$HTTPS_PROXY"
 export all_proxy="$ALL_PROXY"
-export NO_PROXY="localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.internal.example.invalid"
+export NO_PROXY="localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.bytedance.net,bytedance.net,.byted.org,byted.org,.internal.example.invalid"
 export no_proxy="$NO_PROXY"
 unset OPENAI_API_KEY OPENAI_BASE_URL OPENAI_ORG_ID OPENAI_ORGANIZATION OPENAI_PROJECT OPENAI_PROJECT_ID
 
@@ -1150,7 +1153,7 @@ export ALL_PROXY="http://127.0.0.1:10800"
 export http_proxy="$HTTP_PROXY"
 export https_proxy="$HTTPS_PROXY"
 export all_proxy="$ALL_PROXY"
-export NO_PROXY="localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.internal.example.invalid"
+export NO_PROXY="localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.bytedance.net,bytedance.net,.byted.org,byted.org,.internal.example.invalid"
 export no_proxy="$NO_PROXY"
 unset OPENAI_API_KEY OPENAI_BASE_URL OPENAI_ORG_ID OPENAI_ORGANIZATION OPENAI_PROJECT OPENAI_PROJECT_ID
 
@@ -1771,8 +1774,6 @@ repair_remote_forward() {
 
 repair_remote_sockets() {
   force_reset_remote_proxy
-  start_local_socks
-  start_local_http
   SKIP_REMOTE_PLAIN_CHECK=1
   start_remote_forward
   verify_fast
